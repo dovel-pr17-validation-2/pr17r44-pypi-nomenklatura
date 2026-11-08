@@ -1,0 +1,138 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "nomenklatura"
+version = "4.17.6"
+description = "Make record linkages in followthemoney data."
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [{ name = "OpenSanctions", email = "info@opensanctions.org" }]
+classifiers = [
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+requires-python = ">= 3.11"
+dependencies = [
+    "followthemoney >= 4.11.2, < 5.0.0",
+    "rigour >= 2.6.1, < 3.0.0",
+    "fingerprints >= 1.3.1, < 2.0.0",
+    "shortuuid >= 1.0.11, < 2.0.0",
+    "rich >= 13.0.0, < 16.0.0",
+    "textual >= 3.0.0, < 9.0.0",
+    "sqlalchemy >= 2.1.0",
+    "scikit-learn == 1.9.1",
+    "pydantic > 2.0.0, < 3.0.0",
+    "click < 9.0.0",
+    "lxml > 4.0.0, < 7.0.0",
+    "duckdb >= 1.2.0, < 2.0.0",
+    "urllib3 >= 2.0.0, < 3.0.0",
+]
+
+[project.urls]
+Documentation = "https://github.com/opensanctions/nomenklatura/"
+Repository = "https://github.com/opensanctions/nomenklatura.git"
+Issues = "https://github.com/opensanctions/nomenklatura/issues"
+
+[project.scripts]
+nk = "nomenklatura.cli:cli"
+nomenklatura = "nomenklatura.cli:cli"
+
+[project.optional-dependencies]
+dev = [
+    "wheel>=0.29.0",
+    "twine",
+    "mypy",
+    "build",
+    "flake8>=2.6.0",
+    "pytest",
+    "pytest-cov",
+    "pytest-asyncio",
+    "coverage>=4.1",
+    "types-setuptools",
+    "types-requests",
+    "types-PyYAML",
+    "lxml-stubs",
+    "requests-mock",
+    "plyvel < 2.0.0",
+    "psycopg[binary] >= 3.0, < 4.0",
+    "bump-my-version",
+    "prek",
+]
+leveldb = ["plyvel < 2.0.0"]
+docs = [
+    "mkdocs",
+    "mkdocs-material",
+    "mkdocstrings[python]",
+]
+
+[tool.hatch.build.targets.sdist]
+only-include = ["nomenklatura", "LICENSE", "README.md"]
+
+[tool.distutils.bdist_wheel]
+universal = true
+
+[tool.ruff.lint]
+# Rule families below are clean across nomenklatura/, tests/ and contrib/, so
+# the hook fails on a regression rather than on pre-existing debt. Individual
+# codes are pinned where the wider family still has open findings; run
+# `ruff check --select ALL --statistics` to see what is left on the table.
+select = [
+    "ASYNC", # flake8-async
+    "E4",    # pycodestyle: imports (E501 line length is left to the formatter)
+    "E7",
+    "E9",
+    "F",     # pyflakes
+    "FURB",  # refurb
+    "I",     # isort
+    "ICN",   # flake8-import-conventions
+    "INT",   # flake8-gettext
+    "LOG",   # flake8-logging
+    "PIE",   # flake8-pie
+    "Q",     # flake8-quotes
+    "RSE",   # flake8-raise
+    "SLOT",  # flake8-slots
+    "W",     # pycodestyle warnings
+    "YTT",   # flake8-2020
+    "B006",  # mutable argument default
+    "B905",  # zip() without explicit strict=
+    "PGH003", # blanket type: ignore
+    "RUF012", # mutable class default without ClassVar
+    "RUF022", # unsorted __all__
+    "RUF023", # unsorted __slots__
+    "TC006",  # unquoted cast() type
+    "UP004",  # useless object inheritance
+    "UP006",  # PEP 585 generics
+    "UP007",  # PEP 604 unions
+    "UP012",  # unnecessary encode("utf-8")
+    "UP015",  # redundant open() mode
+    "UP017",  # datetime.UTC
+    "UP035",  # deprecated typing imports
+    "UP045",  # PEP 604 optionals
+]
+
+[tool.bumpversion]
+current_version = "4.17.6"
+tag_name = "{new_version}"
+commit = true
+tag = true
+
+[[tool.bumpversion.files]]
+filename = "pyproject.toml"
+search = 'version = "{current_version}"'
+replace = 'version = "{new_version}"'
+
+[[tool.bumpversion.files]]
+filename = "nomenklatura/__init__.py"
+
+[tool.coverage.run]
+branch = true
+
+[tool.pytest.ini_options]
+# Log a stack trace when a test takes longer than 300 seconds
+faulthandler_timeout = 300
+asyncio_default_fixture_loop_scope = "function"

@@ -1,0 +1,268 @@
+from followthemoney import model
+from followthemoney.names import schema_type_tag
+from followthemoney.proxy import E, EntityProxy
+from followthemoney.types import registry
+from rigour.names import (
+    Alignment,
+    CompareConfig,
+    Name,
+    NamePart,
+    NamePartTag,
+    NameTypeTag,
+    align_person_name_order,
+    compare_parts,
+    normalize_name,
+    remove_obj_prefixes,
+)
+from rigour.names.symbol import pair_symbols
+
+from nomenklatura.matching.logic_v2.names.analysis import (
+    entity_names,
+    entity_names_consolidated,
+    names_product,
+)
+from nomenklatura.matching.logic_v2.names.distance import strict_levenshtein
+from nomenklatura.matching.logic_v2.names.magic import (
+    SYM_SCORES,
+    SYM_WEIGHTS,
+    extra_match_weights,
+    weight_extra_match,
+)
+from nomenklatura.matching.logic_v2.names.util import (
+    explain_alignment,
+    is_family_name,
+    numbers_mismatch,
+    part_tags_compatible,
+)
+from nomenklatura.matching.types import FtResult, ScoringConfig
+from nomenklatura.matching.util import FNUL
+
+
+def match_name_symbolic(
+    query: Name,
+    result: Name,
+    compare_config: CompareConfig,
+    extra_query_weight: float,
+    extra_result_weight: float,
+    family_name_weight: float,
+) -> tuple[FtResult, list[Alignment]]:
+    # Stage 1: Generate all valid symbol-based pairings
+    # pairings = generate_symbol_pairings(query, result)
+
+    # Stage 2: We compute the score for each pairing, which is a combination of the
+    # symbolic match (some types of symbols are considered less strong matches than others) and
+    # the fuzzy match of the remaining name parts. Special scoring is also applied for extra
+    # name parts that are not matched to the other name during name alignment.
+    retval = FtResult(score=FNUL, detail=None)
+    retmatches: list[Alignment] = []
+    query_extras = extra_match_weights(query)
+    result_extras = extra_match_weights(result)
+    for edges in pair_symbols(query, result):
+        # Symbol-paired alignments arrive with score=1.0 and weight=1.0 placeholders.
+        # Override per category before composing.
+        matches: list[Alignment] = []
+        for edge in edges:
+            assert edge.symbol is not None
+            edge.score = SYM_SCORES.get(edge.symbol.category, 1.0)
+            edge.weight = SYM_WEIGHTS.get(edge.symbol.category, 1.0)
+            matches.append(edge)
+
+        # Remainders — parts not covered by any edge in this pairing
+        query_used = {p for edge in edges for p in edge.qps}
+        result_used = {p for edge in edges for p in edge.rps}
+        query_rem = [p for p in query.parts if p not in query_used]
+        result_rem = [p for p in result.parts if p not in result_used]
+
+        if len(query_rem) > 0 or len(result_rem) > 0:
+            # Callers may pass names analyzed with different type tags.
+            if NameTypeTag.PER in (query.tag, result.tag):
+                query_rem, result_rem = align_person_name_order(query_rem, result_rem)
+            else:
+                query_rem = NamePart.tag_sort(query_rem)
+                result_rem = NamePart.tag_sort(result_rem)
+
+            # Residue-distance handoff: rigour's compare_parts owns the
+            # cost-folded DP, clustering, and per-side scoring; the
+            # Alignments it returns carry symbol=None and a per-cluster
+            # fuzzy score with weight=1.0. Matcher policy (extras
+            # penalty, stopword multiplier, family-name boost) is
+            # applied below — this is the only line in the function
+            # that crosses into the rigour primitive.
+            matches.extend(compare_parts(query_rem, result_rem, config=compare_config))
+
+        # Apply additional weight and score normalisation to the generated matches based
+        # on contextual clues.
+        for match in matches:
+            # Matches with one side empty, i.e. unmatched parts
+            if len(match.qps) == 0:
+                bias = weight_extra_match(match.rps, result_extras)
+                match.weight = extra_result_weight * bias
+            elif len(match.rps) == 0:
+                bias = weight_extra_match(match.qps, query_extras)
+                match.weight = extra_query_weight * bias
+
+            if (len(match.qps) == 1 and match.qps[0].tag == NamePartTag.STOP) or (
+                len(match.rps) == 1 and match.rps[0].tag == NamePartTag.STOP
+            ):
+                # Stopword multiplier: composes with whatever weight
+                # the prior branch contributed (extras override,
+                # SYM_WEIGHTS, residue default). Symmetric with the
+                # family-name boost below.
+                match.weight *= 0.7
+
+            # We fall through here to apply the family-name boost to unmatched parts too.
+
+            # Symbol-paired edges default to a category score (e.g. NAME → 0.9), but if
+            # both sides' surface forms agree we want a clean 1.0 — the literal-equality
+            # rescue. Use the cached qstr/rstr instead of zipping per-part comparables.
+            if (
+                match.score < 1.0
+                and match.qps
+                and match.rps
+                and match.qstr == match.rstr
+            ):
+                match.score = 1.0
+
+            # We treat family names matches as more important (but configurable) because
+            # they're just globally less murky and changeable than given names.
+            if is_family_name(match):
+                match.weight *= family_name_weight
+
+        # Sum up and average all the weights to get the final score for this pairing.
+        # score = sum(weights) / len(weights) if len(weights) > 0 else 0.0
+        total_weight = sum(m.weight for m in matches)
+        total_score = sum(m.score * m.weight for m in matches)
+        score = total_score / total_weight if total_weight > 0 else 0.0
+        if score > retval.score:
+            # We are not turning the matches into a detail string here because this is the hot
+            # path and the string generation takes a non-trivial amount of time. We defer it
+            # until the end when we know which matches we will return.
+            retmatches = list(matches)
+            retval = FtResult(
+                score=score,
+                query=query.original,
+                candidate=result.original,
+            )
+            if score == 1.0:
+                break
+    return retval, retmatches
+
+
+def _get_object_names(entity: EntityProxy) -> set[str]:
+    """Get the names of an object entity, such as a vessel or asset."""
+    names = entity.get_type_values(registry.name, matchable=True)
+    if not names:
+        return set()
+    normalized = [normalize_name(name) for name in names]
+    return set([n for n in normalized if n is not None])
+
+
+def match_object_names(query: E, result: E, config: ScoringConfig) -> FtResult:
+    """Match the names of two objects, such as vessels or assets."""
+    result_names = _get_object_names(result)
+    mismatch_penalty = 1 - config.get_float("nm_number_mismatch")
+    best_result = FtResult(score=FNUL, detail=None)
+    for query_name in _get_object_names(query):
+        query_name = remove_obj_prefixes(query_name)
+        for result_name in result_names:
+            result_name = remove_obj_prefixes(result_name)
+            score = strict_levenshtein(query_name, result_name, max_rate=5)
+            if score == 1.0:
+                detail = f"[{result_name!r} literalMatch]"
+            else:
+                detail = f"[{query_name!r}≈{result_name!r}, fuzzyMatch: {score:.2f}]"
+            if numbers_mismatch(query_name, result_name):
+                score = score * mismatch_penalty
+                detail = "Number mismatch"
+            if score > best_result.score:
+                best_result = FtResult(
+                    score=score, detail=detail, query=query_name, candidate=result_name
+                )
+    return best_result
+
+
+def name_match(query: E, result: E, config: ScoringConfig) -> FtResult:
+    """Match two entities by analyzing and comparing their names."""
+    schema = model.common_schema(query.schema, result.schema)
+    type_tag = schema_type_tag(schema)
+    if type_tag == NameTypeTag.UNK:
+        # Name matching is not supported for entities that are not listed
+        # as a person, organization, or a thing.
+        return FtResult(score=FNUL, detail=None)
+    if type_tag == NameTypeTag.OBJ:
+        return match_object_names(query, result, config)
+    name_prop = config.get_optional_string("nm_name_property")
+    # Analyze both sides with the type of the common schema. A LegalEntity query
+    # against a Person result then gets person-name handling: INITIAL symbols,
+    # the person tagger and person name-order alignment.
+    query_names = entity_names(query, prop=name_prop, is_query=True, type_tag=type_tag)
+    result_names = entity_names(result, prop=name_prop, type_tag=type_tag)
+
+    # For literal matches, return early instead of performing all the magic. This addresses
+    # a user surprise where literal matches can score below 1.0 after name de-duplication has
+    # only left a superset name on one side. Names whose part tags contradict each other
+    # (e.g. a reversed firstName/lastName query against a "Family, Given"-form alias) don't
+    # qualify — they fall through to the full machinery, which penalises the role swap.
+    query_comparable: dict[str, list[Name]] = {}
+    for name in query_names:
+        query_comparable.setdefault(name.comparable, []).append(name)
+    result_comparable: dict[str, list[Name]] = {}
+    for name in result_names:
+        result_comparable.setdefault(name.comparable, []).append(name)
+    common = set(query_comparable).intersection(result_comparable)
+    for comparable in sorted(common, key=len, reverse=True):
+        for q_name in query_comparable[comparable]:
+            for r_name in result_comparable[comparable]:
+                if not part_tags_compatible(q_name, r_name):
+                    continue
+                align = Alignment(qps=q_name.parts, rps=r_name.parts, score=1.0)
+                return FtResult(
+                    score=1.0,
+                    detail=explain_alignment(align),
+                    query=q_name.original,
+                    candidate=r_name.original,
+                )
+
+    # Remove short names that are contained in longer names.
+    # This prevents a scenario where a short version of a name ("John
+    # Smith") is matched to a query ("John K Smith"), where a longer version
+    # ("John K Smith" != "John R Smith") would have disqualified the match.
+    query_names = entity_names_consolidated(
+        query, prop=name_prop, is_query=True, type_tag=type_tag
+    )
+    result_names = entity_names_consolidated(result, prop=name_prop, type_tag=type_tag)
+
+    # Read the scoring parameters once per candidate rather than per name pair.
+    compare_config = CompareConfig(
+        budget_tolerance=config.get_float("nm_fuzzy_cutoff_factor"),
+    )
+    extra_query_weight = config.get_float("nm_extra_query_name")
+    extra_result_weight = config.get_float("nm_extra_result_name")
+    family_name_weight = config.get_float("nm_family_name_weight")
+
+    best = FtResult(score=FNUL, detail=None)
+    best_matches: list[Alignment] = []
+
+    # This combinatorial explosion is the single biggest determinant of the name
+    # matching speed: 1 x 1 is very fast, 2 x 5 still good, but 3 x 200 gets out
+    # of hand. We need to consider more ways to prune pairs before we do a full
+    # symbolic + fuzzy match on them.
+    for query_name, result_name in names_product(query_names, result_names):
+        ftres, ftmatches = match_name_symbolic(
+            query_name,
+            result_name,
+            compare_config,
+            extra_query_weight,
+            extra_result_weight,
+            family_name_weight,
+        )
+        if ftres.score >= best.score:
+            best = ftres
+            best_matches = ftmatches
+            if best.score == 1.0:
+                break
+    if len(best_matches) > 0 and best.detail is None:
+        best.detail = " ".join(explain_alignment(m) for m in best_matches)
+    if best.detail is None:
+        best.detail = "No name match found."
+    return best

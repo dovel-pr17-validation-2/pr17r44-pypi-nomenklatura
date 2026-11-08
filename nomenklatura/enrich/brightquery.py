@@ -1,0 +1,194 @@
+import logging
+from collections.abc import Generator
+from typing import Any
+
+import requests
+from banal import hash_data
+from followthemoney import DS, SE, registry
+from normality import slugify
+from requests.adapters import HTTPAdapter
+from requests.exceptions import RequestException
+from urllib3.util.retry import Retry
+
+from nomenklatura.cache import Cache
+from nomenklatura.enrich.common import Enricher, EnricherConfig
+
+log = logging.getLogger(__name__)
+
+
+class BrightQueryEnricher(Enricher[DS]):
+    """Match organizations against the BrightQuery Business Identity API,
+    which covers US legal entities and their state registrations. Requires
+    an API key."""
+
+    BASE_URL = "https://apigw.brightquery.com/search/identity/org"
+
+    def __init__(
+        self,
+        dataset: DS,
+        cache: Cache,
+        config: EnricherConfig,
+        session: requests.Session | None = None,
+    ):
+        super().__init__(dataset, cache, config, session)
+        self._api_key = self.get_config_expand("api_key", "${BRIGHTQUERY_API_KEY}")
+        if not self._api_key:
+            raise ValueError("Missing BrightQuery API key.")
+
+        retries = Retry(
+            total=5,
+            backoff_factor=40,
+            backoff_max=600,
+            status_forcelist=[
+                504,  # 504 Gateway Timeout
+                502,  # 502 Bad Gateway
+                401,  # 401 Unauthorized - intermittent error with no known reason. They've ok'd retrynig this.
+            ]
+            + list(Retry.RETRY_AFTER_STATUS_CODES),
+            allowed_methods=frozenset(["POST"]),
+            # Once retries are exhausted, return the last response instead of raising
+            # a RetryError. That lets us inspect the actual status code (e.g. a
+            # persistent 503) structurally in search() rather than string-matching
+            # the "too many 503 error responses" message urllib3 buries in a
+            # ResponseError.
+            raise_on_status=False,
+        )
+        adapter = HTTPAdapter(max_retries=retries)
+        self.session.mount("https://apigw.brightquery.com", adapter)
+        self.session.headers.update({"x-api-key": self._api_key})
+
+        self.skip_jurisdictions = set(self.get_config_list("skip_jurisdictions"))
+        """Set of jurisdiction codes to skip during enrichment because they're not covered by
+        BrightQuery/opendata.org."""
+
+    def create_proxy(
+        self, entity: SE, child: dict[str, Any]
+    ) -> Generator[SE, None, None]:
+        # Primary, most common name of the Organization, which equals the name of
+        # the ultimate parent or sole entity that comprises the Organization.
+        org_name = child.get("bq_organization_name")
+        # Some records do not have Legal Entity names. Then we fall back to the org_name.
+        name = child.get("bq_legal_entity_name") or org_name
+        if not name:
+            log.warning(
+                "BrightQuery record without name: %s",
+                child.get("bq_legal_entity_id"),
+            )
+            return
+        proxy = self.make_entity(entity, "Company")
+        # Unique ID of the Organization. An Organization is the concept of a company,
+        # which is constructed as a collection of Legal Entities (child and parent entities)
+        # and Locations (e.g., offices, stores).
+        bq_org_id = child.get("bq_organization_id")
+        # Unique ID of the Legal Entity. A Legal Entity is part of an Organization and is
+        # registered with the Secretary of State of a jurisdiction.
+        # LegalEntity is the primary object of interest for our processing.
+        bq_entity_id = child.get("bq_legal_entity_id")
+        if bq_entity_id is not None:
+            proxy.id = slugify(bq_entity_id, "-")
+        if proxy.id is None and bq_org_id is not None:
+            proxy.id = f"bqo-{slugify(bq_org_id, '-')}"
+
+        if proxy.id is None:
+            log.error("BrightQuery record without IDs: %s", name)
+            return
+
+        if len(proxy.id) > registry.entity.max_length:
+            log.error(
+                "BrightQuery generated ID too long (%d): %s",
+                len(proxy.id),
+                proxy.id,
+            )
+            return
+
+        if not proxy.id.startswith("bq-") and not proxy.id.startswith("bqo-"):
+            log.error("BrightQuery ID without prefix: %s", proxy.id)
+            return
+
+        # Legal name of the Legal Entity
+        proxy.add("name", name)
+        proxy.add("brightQueryOrgId", bq_org_id)
+        proxy.add("brightQueryId", bq_entity_id)
+        # Link to the Organization's primary website.
+        proxy.add("website", child.get("bq_website"))
+        proxy.add("address", child.get("bq_legal_entity_address_summary"))
+        # Jurisdiction code (2-digit state name) in which the Legal Entity is registered,
+        # typically with the Secretary of State.
+        proxy.add("jurisdiction", child.get("bq_legal_entity_jurisdiction_code"))
+        # Date on which the Legal Entity was registered with the Secretary of State.
+        founded = child.get("bq_legal_entity_date_founded")
+        proxy.add("incorporationDate", founded)
+        log.info("Candidate [%s]: %s", proxy.id, name)
+        yield proxy
+
+    def search(self, payload: dict[str, Any]) -> Generator[dict[str, str], None, None]:
+        cache_id = hash_data(payload)
+        cache_key = f"{self.BASE_URL}:{cache_id}"
+
+        # We have to re-implement http_post_json_cached here because the endpoint doesn't
+        # return JSON when there are no results.
+        resp_data = self.cache.get_json(cache_key, max_age=self.cache_days)
+        # An empty result is cached as `{}`, which is falsy but still a cache hit.
+        if resp_data is None:
+            log.info("BrightQuery search: %r", payload)
+            try:
+                response = self.session.post(
+                    self.BASE_URL, json=payload, timeout=(10, 300)
+                )
+                # When no results are found, the API helpfully doesn't return JSON
+                # but just a 204 with an empty response body.
+                if response.status_code == 204:
+                    # Cache the empty result to avoid hitting the API again
+                    # for the same query.
+                    self.cache.set_json(cache_key, {})
+                    return
+                response.raise_for_status()
+            except RequestException as rex:
+                # Because the Retry is configured with raise_on_status=False, an
+                # exhausted retry (e.g. the persistent 503s in
+                # opensanctions/opensanctions#4293) surfaces here as an HTTPError
+                # carrying the real response, so we can log the actual status code
+                # structurally instead of parsing the opaque RetryError. Record the
+                # query that triggered it, then let the error propagate and crash.
+                status_code = (
+                    rex.response.status_code if rex.response is not None else None
+                )
+                log.error(
+                    "BrightQuery search failed [%s] for query %r: %s",
+                    status_code,
+                    payload,
+                    rex,
+                )
+                raise
+            resp_data = response.json()
+            self.cache.set_json(cache_key, resp_data)
+        # Number of records per hit is 10. Records are sorted by revenue and employees headcount.
+        for child in resp_data.get("root", {}).get("children", []):
+            yield child
+
+    def match(self, entity: SE) -> Generator[SE, None, None]:
+        if not entity.schema.is_a("Organization"):
+            return
+
+        countries = entity.get_type_values(registry.country, matchable=True)
+        if len(countries) > 0 and all(c in self.skip_jurisdictions for c in countries):
+            log.info(
+                "Skipping BrightQuery enrichment for %r: unsupported jurisdictions %r",
+                entity.id,
+                countries,
+            )
+            return
+
+        # Get the name and address to search
+        addresses = entity.get("address")
+        address = max(addresses, key=len) if len(addresses) > 0 else None
+        for name in entity.get("name"):
+            # If we have an address, we can search by both name and address
+            payload = {"company_name": name}
+            if address:
+                payload["address"] = address
+            for match in self.search(payload):
+                yield from self.create_proxy(entity, match)
+
+    def expand(self, entity: SE, match: SE) -> Generator[SE, None, None]:
+        yield match

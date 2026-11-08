@@ -1,0 +1,237 @@
+import logging
+from datetime import datetime
+from typing import TYPE_CHECKING, Any
+
+from normality import stringify
+from rigour.dates import ended_before
+from rigour.langs import iso_639_alpha3
+
+from nomenklatura.wikidata.lang import LangText
+from nomenklatura.wikidata.value import snak_value_to_string
+
+if TYPE_CHECKING:
+    from nomenklatura.wikidata.client import WikidataClient
+
+log = logging.getLogger(__name__)
+
+
+class Snak:
+    """Some Notation About Knowledge (TM)."""
+
+    def __init__(self, client: "WikidataClient", data: dict[str, Any]):
+        self.client = client
+        datavalue = data.pop("datavalue", {})
+        self.value_type: str = datavalue.pop("type", None)
+        self._value = datavalue.pop("value", None)
+        data.pop("hash", None)
+        self.type = data.pop("datatype", None)
+        self.property: str | None = data.pop("property", None)
+        self.snaktype = data.pop("snaktype", None)
+        # self._data = data
+
+    @property
+    def property_label(self) -> LangText:
+        return self.client.get_label(self.property)
+
+    @property
+    def qid(self) -> str | None:
+        if self.value_type == "wikibase-entityid":
+            return stringify(self._value.get("id"))
+        return None
+
+    @property
+    def text(self) -> LangText:
+        return snak_value_to_string(self.client, self.value_type, self._value)
+
+    def __repr__(self) -> str:
+        return f"<Snak({self.qid}, {self.property}, {self.value_type})>"
+
+
+class Reference:
+    def __init__(self, client: "WikidataClient", data: dict[str, Any]) -> None:
+        self.snaks: dict[str, list[Snak]] = {}
+        for prop, snak_data in data.pop("snaks", {}).items():
+            self.snaks[prop] = [Snak(client, s) for s in snak_data]
+
+    def get(self, prop: str) -> list[Snak]:
+        return self.snaks.get(prop, [])
+
+
+class Claim(Snak):
+    """One property statement on a Wikidata item — e.g. `P569` (date of birth)
+    on a person — including its qualifiers, references, and rank."""
+
+    def __init__(
+        self, client: "WikidataClient", data: dict[str, Any], prop: str
+    ) -> None:
+        self.id = data.pop("id")
+        self.rank = data.pop("rank")
+        super().__init__(client, data.pop("mainsnak"))
+        self.qualifiers: dict[str, list[Snak]] = {}
+        for prop, snaks in data.pop("qualifiers", {}).items():
+            self.qualifiers[prop] = [Snak(client, s) for s in snaks]
+
+        self.references = [Reference(client, r) for r in data.pop("references", [])]
+        self.property = self.property or prop
+        self.deprecated = bool(self.rank == "deprecated")
+
+    def get_qualifier(self, prop: str) -> list[Snak]:
+        return self.qualifiers.get(prop, [])
+
+    def is_ended(self, reference_time: datetime | None = None) -> bool:
+        """Whether the claim's validity period (P582) ended before
+        `reference_time`, defaulting to the client's run reference time.
+
+        A "no value" end time is Wikidata's way of asserting a claim is
+        current, and an imprecise end date only counts once its whole span
+        has elapsed — so a year-precision end in the current year is not
+        yet ended."""
+        if reference_time is None:
+            reference_time = self.client.reference_time
+        for snak in self.qualifiers.get("P582", []):
+            if snak.snaktype == "novalue":
+                continue
+            if snak.snaktype == "somevalue":
+                # Ended at an unknown date:
+                return True
+            text = snak.text.text
+            if text is None:
+                # An end is asserted, but the date didn't convert:
+                return True
+            try:
+                if ended_before(text, reference_time):
+                    return True
+            except ValueError:
+                return True
+        return False
+
+    def __repr__(self) -> str:
+        return f"<Claim({self.qid}, {self.property}, {self.value_type})>"
+
+    def __hash__(self) -> int:
+        return hash((self.qid, self.property, self.id))
+
+
+class SiteLink:
+    def __init__(self, qid: str, data: dict[str, Any]) -> None:
+        self.qid = qid
+        self.site = data.pop("site")
+        self.is_wiki = self.site.endswith("wiki")
+        # Site codes use underscores where the wiki subdomain uses hyphens
+        # (zh_yuewiki -> zh-yue.wikipedia.org), so translate to the hostname form.
+        self.wiki_site = self.site[:-4].replace("_", "-") if self.is_wiki else None
+        self.title = data.pop("title")
+        self.badges = data.pop("badges", [])
+        self.url = str(data.pop("url")) if "url" in data else None
+
+    @property
+    def lang(self) -> str | None:
+        if self.wiki_site is not None:
+            return iso_639_alpha3(self.wiki_site)
+        return None
+
+    @property
+    def linked_url(self) -> str:
+        return f"https://www.wikidata.org/wiki/Special:GoToLinkedPage/{self.site}/{self.qid}"
+
+
+class Item:
+    """A wikidata item (or entity)."""
+
+    def __init__(self, client: "WikidataClient", data: dict[str, Any]) -> None:
+        self.client = client
+        self.id: str = data.pop("id")
+        self.modified: str | None = data.pop("modified", None)
+
+        self.labels: set[LangText] = LangText.from_dict(data.pop("labels", {}))
+        self.aliases: set[LangText] = LangText.from_dict(data.pop("aliases", {}))
+
+        descriptions = LangText.from_dict(data.pop("descriptions", {}))
+        self.description = LangText.pick(descriptions)
+
+        self.claims: list[Claim] = []
+        self.deprecated: list[Claim] = []
+        claims: dict[str, list[dict[str, Any]]] = data.pop("claims", {})
+        for prop, values in claims.items():
+            for value in values:
+                claim = Claim(client, value, prop)
+                if claim.deprecated:
+                    self.deprecated.append(claim)
+                else:
+                    self.claims.append(claim)
+
+        # Merged pages handling:
+        redirects = data.pop("redirects", {})
+        self.redirect_id = redirects.get("to", None)
+        if self.redirect_id is not None:
+            self.id = self.redirect_id
+
+        self.sitelinks: list[SiteLink] = []
+        for data in data.pop("sitelinks", {}).values():
+            self.sitelinks.append(SiteLink(self.id, data))
+
+    @property
+    def label(self) -> LangText | None:
+        label = LangText.pick(self.labels)
+        if label is not None:
+            return label
+        return LangText.pick(self.aliases)
+
+    @property
+    def sorted_labels(self) -> list[LangText]:
+        return LangText.sorted(self.labels)
+
+    @property
+    def sorted_aliases(self) -> list[LangText]:
+        return LangText.sorted(self.aliases)
+
+    @property
+    def wikilinks(self) -> list[SiteLink]:
+        wikilinks = [s for s in self.sitelinks if s.is_wiki]
+        # Skip commonswiki since it doesn't offer much more than wikidata as a wiki website.
+        return [s for s in wikilinks if s.site != "commonswiki"]
+
+    def is_instance(self, qid: str) -> bool:
+        for claim in self.claims:
+            if claim.property == "P31" and claim.qid == qid:
+                return True
+        return False
+
+    def _types(self, path: list[str]) -> set[str]:
+        qid = path[-1]
+        types = set([qid])
+        if len(path) > 6:
+            return types
+
+        item = self if qid == self.id else self.client.fetch_item(qid)
+        if item is None:
+            # A deleted P31/P279 ancestor shouldn't break type expansion:
+            log.warning("Missing type ancestor item: %s (path: %r)", qid, path)
+            return types
+        for type_ in _type_props(item):
+            if type_ not in path:
+                types.update(self._types(path + [type_]))
+        return types
+
+    @property
+    def types(self) -> set[str]:
+        """Get all the `instance of` and `subclass of` types for an item."""
+        return self._types([self.id])
+
+    def __repr__(self) -> str:
+        return f"<Item({self.id})>"
+
+    def __hash__(self) -> int:
+        return hash(self.id)
+
+
+def _type_props(item: Item) -> list[str]:
+    types: list[str] = []
+    for claim in item.claims:
+        # historical countries are always historical:
+        ended = claim.is_ended() and claim.qid != "Q3024240"
+        if ended or claim.qid is None:
+            continue
+        if claim.property in ("P31", "P279"):
+            types.append(claim.qid)
+    return types

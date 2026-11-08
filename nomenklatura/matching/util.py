@@ -1,0 +1,77 @@
+from collections.abc import Callable, Iterable
+from itertools import product
+from pathlib import Path
+from typing import Any, TypeVar
+
+from followthemoney import model
+from followthemoney.exc import InvalidData
+from followthemoney.proxy import E
+from followthemoney.types.common import PropertyType
+
+from nomenklatura import __version__
+from nomenklatura.util import DATA_PATH
+
+V = TypeVar("V")
+BASE_URL = "https://github.com/opensanctions/nomenklatura/blob/%s/nomenklatura/%s#L%s"
+CODE_PATH = DATA_PATH.joinpath("..").resolve()
+FNUL = 0.0
+
+# Cache enough to cover the number of comparisons in a batch where "query" is compared
+# to many "results".
+MEMO_BATCH = 1000
+
+
+def has_schema(left: E, right: E, *schemata: str) -> bool:
+    """Check if the composite schema of two entities matches any of the required schemata."""
+    try:
+        common = model.common_schema(left.schema, right.schema)
+        for schema in schemata:
+            if common.is_a(schema):
+                return True
+        return False
+    except InvalidData:
+        return False
+
+
+def props_pair(left: E, right: E, props: list[str]) -> tuple[set[str], set[str]]:
+    left_values: set[str] = set()
+    right_values: set[str] = set()
+    for prop in props:
+        if prop in left.schema.properties:
+            left_values.update(left.get(prop, quiet=True))
+        if prop in right.schema.properties:
+            right_values.update(right.get(prop, quiet=True))
+    return left_values, right_values
+
+
+def type_pair(left: E, right: E, type_: PropertyType) -> tuple[list[str], list[str]]:
+    left_values = left.get_type_values(type_, matchable=True)
+    right_values = right.get_type_values(type_, matchable=True)
+    return left_values, right_values
+
+
+def max_in_sets(
+    left: Iterable[V | None],
+    right: Iterable[V | None],
+    compare_func: Callable[[V, V], float],
+    max_res: float = 1.0,
+) -> float:
+    """Compare two sets of values pair-wise and select the highest-scored result."""
+    res: float = 0.0
+    for le, ri in product(left, right):
+        if le is None or ri is None:
+            continue
+        v = compare_func(le, ri)
+        if v <= res:
+            continue
+        res = v
+        if res >= max_res:
+            return res
+    return res
+
+
+def make_github_url(func: Callable[..., Any]) -> str:
+    """Make a URL to the source code of a matching function."""
+    code_path = Path(func.__code__.co_filename).relative_to(CODE_PATH)
+    line_no = func.__code__.co_firstlineno
+    return BASE_URL % (__version__, code_path, line_no)

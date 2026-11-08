@@ -1,0 +1,76 @@
+from followthemoney.proxy import E
+from followthemoney.types import registry
+
+from nomenklatura.matching.compare.util import extract_numbers, has_overlap, is_disjoint
+from nomenklatura.matching.compat import clean_name_ascii
+from nomenklatura.matching.regression_v1.util import compare_levenshtein, tokenize_pair
+from nomenklatura.matching.util import has_schema, max_in_sets, props_pair, type_pair
+
+
+def birth_place(query: E, result: E) -> float:
+    """Same place of birth."""
+    lv, rv = tokenize_pair(props_pair(query, result, ["birthPlace"]))
+    tokens = min(len(lv), len(rv))
+    return float(len(lv.intersection(rv))) / float(max(2.0, tokens))
+
+
+def address_match(query: E, result: E) -> float:
+    """Text similarity between addresses."""
+    lv, rv = type_pair(query, result, registry.address)
+    lvn = [clean_name_ascii(v) for v in lv]
+    rvn = [clean_name_ascii(v) for v in rv]
+    return max_in_sets(lvn, rvn, compare_levenshtein)
+
+
+def address_numbers(query: E, result: E) -> float:
+    """Compare address numbers while treating missing evidence as neutral."""
+    lv, rv = type_pair(query, result, registry.address)
+    lvn = extract_numbers(lv)
+    rvn = extract_numbers(rv)
+    if not lvn or not rvn:
+        return 0.0
+    common = len(lvn.intersection(rvn))
+    disjoint = len(lvn.difference(rvn))
+    return common - disjoint
+
+
+def phone_match(query: E, result: E) -> float:
+    """Matching phone numbers between the two entities."""
+    lv, rv = type_pair(query, result, registry.phone)
+    return 1.0 if has_overlap(lv, rv) else 0.0
+
+
+def email_match(query: E, result: E) -> float:
+    """Matching email addresses between the two entities."""
+    lv, rv = type_pair(query, result, registry.email)
+    return 1.0 if has_overlap(lv, rv) else 0.0
+
+
+def identifier_match(query: E, result: E) -> float:
+    """Matching identifiers (e.g. passports, national ID cards, registration or
+    tax numbers) between the two entities."""
+    if has_schema(query, result, "Organization"):
+        return 0.0
+    lv, rv = type_pair(query, result, registry.identifier)
+    return 1.0 if has_overlap(lv, rv) else 0.0
+
+
+def org_identifier_match(query: E, result: E) -> float:
+    """Matching identifiers (e.g. registration or tax numbers) between two
+    organizations or companies."""
+    if not has_schema(query, result, "Organization"):
+        return 0.0
+    lv, rv = type_pair(query, result, registry.identifier)
+    return 1.0 if has_overlap(lv, rv) else 0.0
+
+
+def gender_mismatch(query: E, result: E) -> float:
+    """Both entities have a different gender associated with them."""
+    qv, rv = props_pair(query, result, ["gender"])
+    return 1.0 if is_disjoint(qv, rv) else 0.0
+
+
+def country_mismatch(query: E, result: E) -> float:
+    """Both entities are linked to different countries."""
+    qv, rv = type_pair(query, result, registry.country)
+    return 1.0 if is_disjoint(qv, rv) else 0.0

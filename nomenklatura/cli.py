@@ -1,0 +1,432 @@
+import csv
+import logging
+import shutil
+from collections.abc import Generator
+from pathlib import Path
+
+import click
+import yaml
+from followthemoney import Dataset, ValueEntity
+from followthemoney import StatementEntity as Entity
+from followthemoney.cli.aggregate import sorted_aggregate
+from followthemoney.cli.util import (
+    InPath,
+    OutPath,
+    path_entities,
+    path_writer,
+    write_entity,
+)
+from followthemoney.statement import (
+    CSV,
+    FORMATS,
+    Statement,
+    read_path_statements,
+    write_statements,
+)
+
+from nomenklatura.cache import Cache
+from nomenklatura.db import Session, make_session
+from nomenklatura.enrich import Enricher, enrich, make_enricher, match
+from nomenklatura.matching import (
+    DedupeAlgorithm,
+    get_algorithm,
+    train_erun_matcher,
+    train_v1_matcher,
+)
+from nomenklatura.matching.bench import bench_matcher
+from nomenklatura.resolver import Linker, Resolver
+from nomenklatura.resolver.edge import Edge
+from nomenklatura.store import load_entity_file_store
+from nomenklatura.tui import dedupe_ui, reconcile_ui
+from nomenklatura.wikidata.client import WikidataClient
+from nomenklatura.wikidata.reconcile import reconcile as run_reconcile
+from nomenklatura.wikidata.write import QSCommand, serialize
+from nomenklatura.xref import xref as run_xref
+
+INDEX_SEGMENT = "xref-index"
+
+log = logging.getLogger(__name__)
+
+ResPath = click.Path(dir_okay=False, writable=True, path_type=Path)
+
+
+def _load_enricher(session: Session, path: Path) -> tuple[Dataset, Enricher[Dataset]]:
+    with open(path) as fh:
+        data = yaml.safe_load(fh)
+        dataset = Dataset.make(data)
+        cache = Cache(session, dataset, create=True)
+        enricher = make_enricher(dataset, cache, data)
+        if enricher is None:
+            raise TypeError("Could not load enricher")
+        return dataset, enricher
+
+
+def _get_linker() -> Linker[Entity]:
+    with make_session() as session:
+        return Resolver[Entity](session, create=True).get_linker()
+
+
+def _get_data_path(data_path: Path | None) -> Path:
+    if data_path is None:
+        data_path = Path.cwd() / "nomenklatura.data"
+    return data_path
+
+
+@click.group(help="Nomenklatura data integration")
+def cli() -> None:
+    logging.basicConfig(level=logging.INFO)
+
+
+@cli.command("xref", help="Generate dedupe candidates")
+@click.argument("path", type=InPath)
+@click.option("-p", "--data-path", type=Path, default=None)
+@click.option("-a", "--auto-threshold", type=click.FLOAT, default=None)
+@click.option("-l", "--limit", type=click.INT, default=5000)
+@click.option("--algorithm", default=DedupeAlgorithm.NAME)
+@click.option("--scored/--unscored", is_flag=True, type=click.BOOL, default=True)
+@click.option(
+    "-f",
+    "--focus",
+    type=str,
+    multiple=True,
+    help="Require one of the datasets for a candidate pair",
+)
+@click.option("-d", "--discount-internal", type=click.FLOAT, default=1.0)
+@click.option(
+    "-c",
+    "--clear",
+    is_flag=True,
+    default=False,
+    help="Clear the index directory, if it exists.",
+)
+def xref_file(
+    path: Path,
+    data_path: Path | None = None,
+    auto_threshold: float | None = None,
+    algorithm: str = DedupeAlgorithm.NAME,
+    limit: int = 5000,
+    scored: bool = True,
+    clear: bool = False,
+    focus: tuple[str, ...] = (),
+    discount_internal: float = 1.0,
+) -> None:
+    with make_session() as session:
+        resolver = Resolver[Entity](session, create=True)
+        resolver.load_into_memory()
+        data_path = _get_data_path(data_path)
+
+        store = load_entity_file_store(path, resolver=resolver)
+        algorithm_type = get_algorithm(algorithm)
+        if algorithm_type is None:
+            raise click.Abort(f"Unknown algorithm: {algorithm}")
+
+        index_dir = data_path / INDEX_SEGMENT
+        if clear and index_dir.exists():
+            log.info("Clearing index: %s", index_dir)
+            shutil.rmtree(index_dir, ignore_errors=True)
+        run_xref(
+            resolver,
+            session,
+            store,
+            index_dir,
+            auto_threshold=auto_threshold,
+            algorithm=algorithm_type,
+            scored=scored,
+            limit=limit,
+            focus_datasets=set(focus),
+            discount_internal=discount_internal,
+        )
+        log.info("Xref complete in: %r", resolver)
+
+
+@cli.command(
+    "wikidata-reconcile",
+    help="Match persons against Wikidata, auto-merging hits above a threshold",
+)
+@click.argument("path", type=InPath)
+@click.option("-t", "--threshold", type=click.FLOAT, default=0.96)
+@click.option("--algorithm", default=DedupeAlgorithm.NAME)
+@click.option("--aliases/--no-aliases", is_flag=True, default=False)
+@click.option("--retrieved", type=str, default=None, help="Retrieved date for QS refs")
+@click.option(
+    "--source-url",
+    type=str,
+    default=None,
+    help="Fallback QS reference URL for entities without a sourceUrl",
+)
+@click.option("--review", is_flag=True, default=False, help="Confirm matches in a TUI")
+@click.option(
+    "--create",
+    is_flag=True,
+    default=False,
+    help="(headless only) propose new items for unmatched persons",
+)
+def wikidata_reconcile(
+    path: Path,
+    threshold: float = 0.96,
+    algorithm: str = DedupeAlgorithm.NAME,
+    aliases: bool = False,
+    retrieved: str | None = None,
+    source_url: str | None = None,
+    review: bool = False,
+    create: bool = False,
+) -> None:
+    if review and create:
+        # Review mode creates items interactively.
+        raise click.UsageError("--create cannot be combined with --review")
+    session = make_session()
+    try:
+        resolver = Resolver[Entity](session, create=True)
+        resolver.load_into_memory()
+        store = load_entity_file_store(path, resolver=resolver)
+        algorithm_type = get_algorithm(algorithm)
+        if algorithm_type is None:
+            raise click.Abort(f"Unknown algorithm: {algorithm}")
+        dataset = Dataset.make({"name": "wikidata", "title": "Wikidata"})
+        cache = Cache(session, dataset, create=True)
+        client = WikidataClient(cache)
+        if review:
+            commands = reconcile_ui(
+                resolver,
+                session,
+                store,
+                client,
+                dataset,
+                algorithm_type,
+                aliases=aliases,
+                retrieved=retrieved,
+                source_url=source_url,
+            )
+        else:
+            commands = run_reconcile(
+                resolver,
+                session,
+                store,
+                client,
+                dataset,
+                algorithm_type,
+                threshold,
+                aliases=aliases,
+                create=create,
+                retrieved=retrieved,
+                source_url=source_url,
+            )
+    finally:
+        # Keep completed requests and judgements after an interrupted run.
+        session.commit()
+    _write_qs(path.with_name(path.name + ".qs"), commands)
+    log.info("Reconcile complete in: %r", resolver)
+
+
+def _write_qs(path: Path, commands: list[QSCommand]) -> None:
+    text = serialize(commands)
+    if len(text):
+        text += "\n"
+    path.write_text(text)
+    log.info("Wrote %d QuickStatements commands: %s", len(commands), path)
+
+
+@cli.command("prune", help="Remove dedupe candidates")
+def xref_prune() -> None:
+    with make_session() as session:
+        resolver = Resolver[Entity](session, create=True)
+        resolver.load_into_memory()
+        resolver.prune()
+
+
+@cli.command("apply", help="Apply resolver to an entity stream")
+@click.argument("path", type=InPath)
+@click.option("-o", "--outpath", type=OutPath, default="-")
+def apply(path: Path, outpath: Path) -> None:
+    linker = _get_linker()
+    with path_writer(outpath) as outfh:
+        for proxy in path_entities(path, ValueEntity):
+            proxy = linker.apply_stream(proxy)
+            write_entity(outfh, proxy)
+
+
+@cli.command("sorted-aggregate", help="Merge sort-order entities")
+@click.option("-i", "--infile", type=InPath, default="-")
+@click.option("-o", "--outfile", type=OutPath, default="-")
+def sorted_aggregate_(infile: Path, outfile: Path) -> None:
+    sorted_aggregate(infile, outfile, ValueEntity)
+
+
+@cli.command("make-sortable", help="Convert entities into plain-text sortable form")
+@click.argument("path", type=InPath)
+@click.option("-o", "--outpath", type=OutPath, default="-")
+def make_sortable(path: Path, outpath: Path) -> None:
+    with path_writer(outpath) as outfh:
+        for entity in path_entities(path, Entity):
+            write_entity(outfh, entity)
+
+
+@cli.command("dedupe", help="Interactively judge xref candidates")
+@click.argument("path", type=InPath)
+@click.option("-x", "--xref", is_flag=True, default=False)
+@click.option("-p", "--data-path", type=Path, default=None)
+def dedupe(path: Path, xref: bool = False, data_path: Path | None = None) -> None:
+    with make_session() as session:
+        resolver = Resolver[Entity](session, create=True)
+        resolver.load_into_memory()
+        data_path = _get_data_path(data_path)
+        store = load_entity_file_store(path, resolver=resolver)
+        if xref:
+            index_dir = data_path / INDEX_SEGMENT
+            run_xref(resolver, session, store, index_dir)
+        session.checkpoint()
+
+        dedupe_ui(resolver, session, store)
+
+
+@cli.command("train-v1-matcher", help="Train a matching model from judgement pairs")
+@click.argument("pairs_file", type=InPath)
+def train_v1_matcher_(pairs_file: Path) -> None:
+    train_v1_matcher(pairs_file)
+
+
+@cli.command("train-erun-matcher", help="Train an ER model from judgement pairs")
+@click.argument("pairs_file", type=InPath)
+def train_erun_matcher_(pairs_file: Path) -> None:
+    train_erun_matcher(pairs_file)
+
+
+@cli.command("match", help="Generate matches from an enrichment source")
+@click.argument("config", type=InPath)
+@click.argument("entities", type=InPath)
+@click.option("-o", "--outpath", type=OutPath, default="-")
+def match_command(
+    config: Path,
+    entities: Path,
+    outpath: Path,
+) -> None:
+    with make_session() as session:
+        resolver = Resolver[Entity](session, create=True)
+        resolver.load_into_memory()
+        _, enricher = _load_enricher(session, config)
+        try:
+            with path_writer(outpath) as fh:
+                stream = path_entities(entities, Entity)
+                for proxy in match(enricher, resolver, stream):
+                    write_entity(fh, proxy)
+        finally:
+            enricher.close()
+
+
+@cli.command("enrich", help="Fetch extra info from an enrichment source")
+@click.argument("config", type=InPath)
+@click.argument("entities", type=InPath)
+@click.option("-o", "--outpath", type=OutPath, default="-")
+def enrich_command(
+    config: Path,
+    entities: Path,
+    outpath: Path,
+) -> None:
+    with make_session() as session:
+        resolver = Resolver[Entity](session, create=True)
+        resolver.load_into_memory()
+        _, enricher = _load_enricher(session, config)
+        try:
+            with path_writer(outpath) as fh:
+                stream = path_entities(entities, Entity)
+                for proxy in enrich(enricher, resolver, stream):
+                    write_entity(fh, proxy)
+        finally:
+            enricher.close()
+
+
+@cli.command("apply-statements", help="Apply a resolver file to a set of statements")
+@click.option("-i", "--infile", type=InPath, default="-")
+@click.option("-o", "--outpath", type=OutPath, default="-")
+@click.option("-f", "--format", type=click.Choice(FORMATS), default=CSV)
+def statements_apply(infile: Path, outpath: Path, format: str) -> None:
+    linker = _get_linker()
+
+    def _generate() -> Generator[Statement, None, None]:
+        for stmt in read_path_statements(infile, format=format):
+            yield linker.apply_statement(stmt)
+
+    with path_writer(outpath) as outfh:
+        write_statements(outfh, format, _generate())
+
+
+EDGE_FIELDS = [
+    "target",
+    "source",
+    "judgement",
+    "score",
+    "user",
+    "created_at",
+    "deleted_at",
+]
+EDGE_FORMATS = ["jsonl", "csv"]
+
+
+@cli.command("load-resolver", help="Load resolver edges from file into database")
+@click.argument("source", type=InPath)
+@click.option("-f", "--format", type=click.Choice(EDGE_FORMATS), default="jsonl")
+def load_resolver(source: Path, format: str) -> None:
+    with make_session() as session:
+        resolver = Resolver[Entity](session, create=True)
+        if format == "csv":
+
+            def _read_edges() -> Generator[Edge, None, None]:
+                with open(source) as fh:
+                    for row in csv.DictReader(fh):
+                        yield Edge.from_dict(row)
+
+            resolver.load_edges(_read_edges())
+        else:
+            resolver.load(source)
+
+
+@cli.command("dump-resolver", help="Dump resolver decisions from database to file")
+@click.argument("target", type=OutPath)
+@click.option("-f", "--format", type=click.Choice(EDGE_FORMATS), default="jsonl")
+@click.option(
+    "--include-deleted",
+    is_flag=True,
+    default=False,
+    help="Export soft-deleted edges as well (CSV only)",
+)
+def dump_resolver(target: Path, format: str, include_deleted: bool) -> None:
+    if include_deleted and format != "csv":
+        raise click.BadOptionUsage(
+            "--include-deleted",
+            "The jsonl line format cannot represent deleted edges; use -f csv.",
+        )
+    with make_session() as session:
+        resolver = Resolver[Entity](session, create=True)
+        if format == "csv":
+            with open(target, "w") as fh:
+                writer = csv.DictWriter(fh, fieldnames=EDGE_FIELDS)
+                writer.writeheader()
+                for edge in resolver.all_edges(include_deleted=include_deleted):
+                    writer.writerow(edge.to_dict())
+        else:
+            resolver.dump(target)
+
+
+@cli.command("dump-mapping", help="Dump entity_id -> canonical_id mapping to CSV")
+@click.argument("target", type=OutPath)
+def dump_mapping(target: Path) -> None:
+    linker = _get_linker()
+    with open(target, "w") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(["entity_id", "canonical_id"])
+        for entity_id, canonical_id in sorted(
+            linker.mappings(), key=lambda m: (m[1], m[0])
+        ):
+            writer.writerow([entity_id, canonical_id])
+
+
+@cli.command("bench", help="Benchmark a matching algorithm")
+@click.argument("name", type=str)
+@click.argument("pairs_file", type=InPath)
+@click.option("-n", "--number", type=int, default=1000)
+def bench(name: str, pairs_file: Path, number: int = 1000) -> None:
+    bench_matcher(name, pairs_file, number)
+
+
+if __name__ == "__main__":
+    cli()

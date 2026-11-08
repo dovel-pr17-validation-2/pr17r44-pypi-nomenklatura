@@ -1,0 +1,67 @@
+import requests_mock
+from followthemoney import Dataset, StatementEntity
+
+from nomenklatura.enrich import Enricher, make_enricher
+
+PATH = "nomenklatura.enrich.openfigi:OpenFIGIEnricher"
+RESPONSE = {
+    "data": [
+        {
+            "figi": "BBG0005S7P81",
+            "securityType": "EURO-DOLLAR",
+            "marketSector": "Govt",
+            "ticker": "BKRUSS F 12/31/01",
+            "name": "CENTRAL BANK OF RUSSIA",
+            "exchCode": "NOT LISTED",
+            "shareClassFIGI": None,
+            "compositeFIGI": None,
+            "securityType2": None,
+            "securityDescription": "BKRUSS Float 12/31/01",
+        },
+        {
+            "figi": "BBG002T3FYF0",
+            "securityType": "Index",
+            "marketSector": "Index",
+            "ticker": "RCRAMAR",
+            "name": "Bank of Russia Russia Central",
+            "exchCode": None,
+            "shareClassFIGI": None,
+            "compositeFIGI": None,
+            "securityType2": None,
+            "securityDescription": "Bank of Russia Russia Central",
+        },
+    ]
+}
+
+
+dataset = Dataset.make({"name": "ext_open_figi", "title": "OpenFIGI"})
+
+
+def load_enricher(cache_factory) -> Enricher[Dataset]:
+    cache = cache_factory(dataset)
+    return make_enricher(dataset, cache, {"type": PATH})
+
+
+def test_figi_match(cache_factory):
+    enricher = load_enricher(cache_factory)
+    with requests_mock.Mocker(real_http=False) as m:
+        m.post("/v3/search", json=RESPONSE)
+
+        data = {
+            "schema": "Company",
+            "id": "xxx",
+            "properties": {"name": ["Bank of Russia"]},
+        }
+        ent = StatementEntity.from_data(dataset, data)
+        m_results = list(enricher.match(ent))
+        assert len(m_results) == 2, m_results
+        m1 = m_results[0]
+        m2 = m_results[1]
+        assert m1.get("name") == ["CENTRAL BANK OF RUSSIA"], m1
+        assert m2.get("name") == ["Bank of Russia Russia Central"], m2
+
+        e_results = list(enricher.expand(ent, m_results[0]))
+        assert len(e_results) == 2, e_results
+        assert e_results[1].get("ticker") == ["BKRUSS F 12/31/01"], e_results
+        assert e_results[1].get("issuer") == [m_results[0].id], e_results
+    enricher.close()

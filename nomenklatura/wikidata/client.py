@@ -1,0 +1,344 @@
+import json
+import logging
+import time
+from datetime import datetime
+from functools import lru_cache
+from typing import Any
+
+from followthemoney import StatementEntity, registry
+from normality import squash_spaces
+from requests import Session
+from rigour.ids.wikidata import is_qid
+from rigour.time import utc_now
+from rigour.urls import build_url
+from rigour.util import MEMO_SMALL
+from urllib3.exceptions import MaxRetryError
+from urllib3.util import Retry
+
+from nomenklatura.cache import Cache
+from nomenklatura.wikidata.lang import LangText
+from nomenklatura.wikidata.model import Item
+from nomenklatura.wikidata.query import SparqlResponse
+from nomenklatura.wikidata.util import make_session
+
+log = logging.getLogger(__name__)
+
+
+class WikidataClient:
+    """Read items and labels from the Wikidata API and SPARQL endpoint.
+
+    Responses are cached in a SQL-backed `Cache` so that crawlers and enrichers
+    can re-run without fetching the same data again, and requests carry a
+    descriptive user agent and retry handling to stay within Wikidata's API
+    etiquette."""
+
+    WD_API = "https://www.wikidata.org/w/api.php"
+    QUERY_API = "https://query.wikidata.org/sparql"
+    CACHE_SHORT = 1
+    CACHE_MEDIUM = CACHE_SHORT * 7
+    CACHE_LONG = CACHE_SHORT * 30
+    # Retry budget for the transient in-band API errors Wikidata returns as
+    # HTTP 200 (see `_fetch_entities`). Class attributes so they stay tunable
+    # and test-overridable (set the backoff to 0 to skip real sleeps in tests).
+    API_MAX_ATTEMPTS = 3
+    API_RETRY_BACKOFF = 2.0  # seconds, exponential base: 2s, 4s between attempts
+    # Retry budget for SPARQL responses that arrive as HTTP 200 but with a
+    # truncated or corrupt body.
+    QUERY_RETRIES = 3
+    QUERY_RETRY_BACKOFF = 10.0
+
+    LABEL_PREFIX = "wd:lb:"
+    LABEL_CACHE_DAYS = 100
+
+    def __init__(
+        self,
+        cache: Cache,
+        session: Session | None = None,
+        cache_days: int = 14,
+        reference_time: datetime | None = None,
+    ) -> None:
+        self.cache = cache
+        # A bare session gets 403'd (default UA) and throttled by Wikidata, so
+        # default to a configured session with a descriptive UA and retries.
+        self.session = session or make_session()
+        self.cache_days = cache_days
+        # The point in time against which claim validity is evaluated (see
+        # `Claim.is_ended`). Crawlers pass their pinned run time so a whole
+        # run resolves "ended" against one deterministic instant.
+        self.reference_time = (
+            reference_time if reference_time is not None else utc_now()
+        )
+        # self.cache.preload(f"{self.LABEL_PREFIX}%")
+
+    @lru_cache(maxsize=MEMO_SMALL)
+    def fetch_item(
+        self,
+        qid: str,
+        cache_days: int | None = None,
+        modified_at: datetime | None = None,
+    ) -> Item | None:
+        # https://www.mediawiki.org/wiki/Wikibase/API
+        # https://www.wikidata.org/w/api.php?action=help&modules=wbgetentities
+        #
+        # `modified_at` (typically the item's schema:dateModified) invalidates
+        # cache entries stored before that timestamp. This lets callers pin a
+        # fixed `cache_days` while still refetching items known to have changed
+        # upstream since the cached copy was written.
+        params = {
+            "format": "json",
+            "ids": qid,
+            "action": "wbgetentities",
+            # Ask for sitelink URLs for proper wikipedia links:
+            "props": "info|sitelinks/urls|aliases|labels|descriptions|claims|datatype",
+        }
+        url = build_url(self.WD_API, params=params)
+        cache_days = cache_days if cache_days is not None else self.cache_days
+        raw = self.cache.get(url, max_age=cache_days, min_timestamp=modified_at)
+        if raw is None:
+            log.debug(
+                "Cache MISS fetching Wikidata item: %s cache_days=%s modified_at=%s",
+                qid,
+                cache_days,
+                modified_at,
+            )
+            # `_fetch_entities` retries transient in-band errors; it returns
+            # None once they're exhausted (item skipped for this run) and
+            # otherwise a cacheable body, so nothing bad reaches the cache.
+            raw = self._fetch_entities(url)
+            if raw is None:
+                return None
+            self.cache.set(url, raw)
+        else:
+            log.debug(
+                "Cache HIT fetching Wikidata item: %s cache_days=%s modified_at=%s",
+                qid,
+                cache_days,
+                modified_at,
+            )
+        data = json.loads(raw)
+        entities = data.get("entities")
+        if entities is None:
+            # Only a cached `no-such-entity` reaches here: a deleted or
+            # never-created QID is a permanent fact, read as "no such item".
+            return None
+        entity = entities.get(qid)
+        if entity is None or "missing" in entity:
+            return None
+        item = Item(self, entity)
+        if item.id != qid:
+            # Redirected/merged item:
+            #
+            # The modification date doesn't relate to the new QID, but let's
+            # use it as its minimum age nonetheless since there's a good chance
+            # the replacement item was edited around the time the original was merged.
+            return self.fetch_item(
+                item.id, cache_days=cache_days, modified_at=modified_at
+            )
+        return item
+
+    def _fetch_entities(self, url: str) -> str | None:
+        """GET a wbgetentities URL, retrying the transient errors Wikidata hides
+        in HTTP 200 bodies (DB lag, rate limits, internal errors).
+
+        Reach for this instead of a bare `session.get` for any wbgetentities
+        call: the session's status-code retries can't see an in-band 200 error,
+        so a single upstream blip would otherwise abort a whole crawl. Returns
+        the raw response text once it is cacheable — a populated `entities` map,
+        or a permanent `no-such-entity`. Returns None if a transient error
+        outlasts every retry: the caller then reads the item as absent for this
+        run, and, because nothing is cached, a later run refetches it.
+        """
+        error: Any = None
+        for attempt in range(self.API_MAX_ATTEMPTS):
+            res = self.session.get(url)
+            res.raise_for_status()
+            raw = res.text
+            data = json.loads(raw)
+            if data.get("entities") is not None:
+                return raw
+            error = data.get("error", {})
+            if error.get("code") == "no-such-entity":
+                return raw
+            log.warning(
+                "Transient Wikidata API error (attempt %d/%d): %r",
+                attempt + 1,
+                self.API_MAX_ATTEMPTS,
+                error,
+            )
+            if attempt + 1 < self.API_MAX_ATTEMPTS:
+                time.sleep(self.API_RETRY_BACKOFF * (2**attempt))
+        log.warning("Skipping %s after %d failed attempts: %r", url, attempt + 1, error)
+        return None
+
+    @lru_cache(maxsize=100000)
+    def get_label(self, qid: str) -> LangText:
+        cache_key = f"{self.LABEL_PREFIX}{qid}"
+        cached = self.cache.get_json(cache_key, max_age=self.LABEL_CACHE_DAYS)
+        if cached is not None:
+            return LangText.parse(cached)
+        params = {
+            "format": "json",
+            "ids": qid,
+            "action": "wbgetentities",
+            "props": "labels",
+        }
+        url = build_url(self.WD_API, params=params)
+        raw = self._fetch_entities(url)
+        if raw is None:
+            # Transient error outlasted the retries: treat the label as absent.
+            return LangText(None)
+        entities = json.loads(raw).get("entities")
+        if entities is None:
+            # Only a `no-such-entity` body reaches here (see `_fetch_entities`).
+            return LangText(None)
+        entity = entities.get(qid)
+        if entity is None or "missing" in entity:
+            return LangText(None)
+        labels = LangText.from_dict(entity.get("labels", {}))
+        label = LangText.pick(labels)
+        if label is None:
+            label = LangText(qid)
+        label.original = qid
+        self.cache.set_json(cache_key, label.pack())
+        return label
+
+    def query(self, query_text: str, cache_days: int | None = None) -> SparqlResponse:
+        """Query the Wikidata SPARQL endpoint.
+
+        Args:
+          cache_days: overrides the client-level default for this call.
+        """
+        clean_text = squash_spaces(query_text)
+        if len(clean_text) == 0:
+            raise RuntimeError("Invalid query: %r" % query_text)
+        params = {"query": clean_text}
+        url = build_url(self.QUERY_API, params=params)
+        effective_cache = cache_days if cache_days is not None else self.cache_days
+        raw = self.cache.get(url, max_age=effective_cache)
+        if raw is not None:
+            log.debug(
+                "Cache HIT fetching Wikidata SPARQL query: %s cache_days=%s",
+                clean_text,
+                effective_cache,
+            )
+            try:
+                return SparqlResponse(clean_text, json.loads(raw))
+            except json.JSONDecodeError:
+                # Written before responses were validated: drop and refetch.
+                self.cache.delete(url)
+        log.debug(
+            "Cache MISS fetching Wikidata SPARQL query: %s cache_days=%s",
+            clean_text,
+            effective_cache,
+        )
+        raw, data = self._fetch_sparql(url)
+        self.cache.set(url, raw)
+        return SparqlResponse(clean_text, data)
+
+    def _fetch_sparql(self, url: str) -> tuple[str, Any]:
+        """GET a SPARQL query URL, retrying responses whose body doesn't parse.
+
+        The query service sometimes abandons a response mid-stream after it
+        has already sent `200 OK` (e.g. when a query runs into its execution
+        budget under load), leaving a truncated JSON body. The session's
+        status-code retries can't see that, so it is retried here, with backoff.
+        Raises the `JSONDecodeError` once the retries are exhausted.
+        """
+        # As of 2026-10-12 we're hitting the 200 response but invalid json in
+        # about 1/8 crawls, making this worthwhile.
+        # Response times vary between about 8s and their timeout (60s) so optimising
+        # the query might help but might add other complexity.
+
+        headers = {"Accept": "application/sparql-results+json"}
+        retry = Retry(
+            total=self.QUERY_RETRIES,
+            backoff_factor=self.QUERY_RETRY_BACKOFF,
+        )
+        while True:
+            res = self.session.get(url, headers=headers)
+            res.raise_for_status()
+            try:
+                return res.text, json.loads(res.text)
+            except json.JSONDecodeError as err:
+                try:
+                    retry = retry.increment(method="GET", url=url, error=err)
+                except MaxRetryError:
+                    log.error("Failed to parse SPARQL response JSON: %s", err)
+                    raise err
+                log.warning(
+                    "Failed to parse SPARQL response JSON (retry %d/%d): %s",
+                    len(retry.history),
+                    self.QUERY_RETRIES,
+                    err,
+                )
+                retry.sleep()
+
+    def search_items(
+        self, entity: StatementEntity, aliases: bool = False, limit: int = 7
+    ) -> list[str]:
+        """Find Wikidata QIDs that might be the same as an OpenSanctions entity.
+
+        Reach for this when reconciling an OS entity against Wikidata: it runs the
+        entity's names through the `wbsearchentities` API and returns candidate
+        QIDs for a downstream matcher to rank. It returns only QIDs — the caller
+        decides which items to fetch and how to project them — so the client stays
+        decoupled from the matcher's needs.
+
+        All `name` values are searched. With `aliases`, the search also covers
+        aliases (every matchable name-type value), trading more API calls for
+        better recall on transliterated or aliased names. `limit` is the per-name
+        result cap (the `wbsearchentities` default is 7, max 50); raise it for
+        better recall on common names.
+        """
+        if aliases:
+            names = entity.get_type_values(registry.name, matchable=True)
+        else:
+            names = entity.get("name", quiet=True)
+        qids: list[str] = []
+        seen: set[str] = set()
+        for name in names:
+            for qid in self._search_name(name, limit=limit):
+                if qid not in seen:
+                    seen.add(qid)
+                    qids.append(qid)
+        return qids
+
+    def _search_name(self, name: str, limit: int = 7) -> list[str]:
+        if not name.strip():
+            return []
+        params = {
+            "format": "json",
+            "action": "wbsearchentities",
+            "type": "item",
+            "language": "en",
+            "strictlanguage": "false",
+            "limit": str(limit),
+            "search": name,
+        }
+        url = build_url(self.WD_API, params=params)
+        raw = self.cache.get(url, max_age=self.cache_days)
+        if raw is None:
+            res = self.session.get(url)
+            res.raise_for_status()
+            raw = res.text
+            self.cache.set(url, raw)
+        data = json.loads(raw)
+        results = data.get("search")
+        if results is None:
+            # A response without a `search` key is malformed/transient; don't
+            # keep it around to be served from cache.
+            self.cache.delete(url)
+            log.info("Wikidata search has no results: %s", name)
+            return []
+        qids: list[str] = []
+        for result in results:
+            qid = result.get("id")
+            if qid is not None and is_qid(qid):
+                qids.append(qid)
+        return qids
+
+    def __repr__(self) -> str:
+        return "<WikidataClient()>"
+
+    def __hash__(self) -> int:
+        return 42

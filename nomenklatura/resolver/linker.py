@@ -1,0 +1,148 @@
+import warnings
+from collections.abc import Generator
+from typing import Generic
+
+from followthemoney import SE, Statement, ValueEntity, registry
+
+from nomenklatura.resolver.identifier import Identifier
+
+
+class Linker(Generic[SE]):
+    """A class to manage the canonicalisation of entities. This stores only the positive
+    merges of entities and is used as a lightweight way to apply the harmonisation
+    post de-duplication.
+
+    Internally stores a dict[str, tuple[str, ...]] where each cluster is a sorted
+    tuple with the canonical ID at index 0 and referents following. Every node in
+    a cluster maps to the same shared tuple object."""
+
+    def __init__(self, mapping: dict[str, tuple[str, ...]]) -> None:
+        self._mapping: dict[str, tuple[str, ...]] = mapping
+
+    def add(self, left: str, right: str) -> str:
+        """Merge two identifier clusters and return their canonical.
+
+        Idempotence lets the resolver replay database updates without tracking
+        which edges it has already applied.
+        """
+        idents: set[str] = set()
+        for node in (left, right):
+            cluster = self._mapping.get(node)
+            if cluster is not None:
+                idents.update(cluster)
+        idents.update((left, right))
+        # Sort via Identifier ordering (weight, id) so the canonical lands first.
+        members = tuple(i.id for i in sorted(map(Identifier.get, idents), reverse=True))
+        for node in members:
+            self._mapping[node] = members
+        return members[0]
+
+    def connected(self, node: Identifier) -> set[Identifier]:
+        """Return all entities connected to the given node. Constructs Identifier
+        objects on the fly from the internal string representation."""
+        return {Identifier.get(n) for n in self.connected_ids(node.id)}
+
+    def connected_ids(self, entity_id: str) -> tuple[str, ...]:
+        """Return the stored identifiers connected to an entity ID."""
+        return self._mapping.get(entity_id, (entity_id,))
+
+    def get_canonical(self, entity_id: str) -> str:
+        """Return the canonical identifier for the given entity ID."""
+        if isinstance(entity_id, Identifier):
+            warnings.warn(
+                "Passing Identifier objects to get_canonical is deprecated",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            entity_id = entity_id.id
+        cluster = self._mapping.get(entity_id)
+        if cluster is not None:
+            return cluster[0]
+        return entity_id
+
+    def mappings(self) -> Generator[tuple[str, str], None, None]:
+        """Yield (entity_id, canonical_id) for every known identifier, including
+        the canonical itself. Use this to export the resolution outcome as a
+        join table, without edges or judgement history."""
+        for entity_id, cluster in self._mapping.items():
+            yield entity_id, cluster[0]
+
+    def canonicals(self) -> Generator[Identifier, None, None]:
+        """Return all the canonical cluster identifiers."""
+        # Each canonical occurs exactly once in the mapping: as its self-row.
+        for entity_id, canonical_id in self.mappings():
+            if entity_id == canonical_id:
+                ident = Identifier.get(canonical_id)
+                if ident.canonical:
+                    yield ident
+
+    def get_referents(self, canonical_id: str, canonicals: bool = True) -> set[str]:
+        """Get all the non-canonical entity identifiers which refer to a given
+        canonical identifier."""
+        if isinstance(canonical_id, Identifier):
+            warnings.warn(
+                "Passing Identifier objects to get_referents is deprecated",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            canonical_id = canonical_id.id
+        cluster = self._mapping.get(canonical_id)
+        if cluster is None:
+            return set()
+        referents = set(cluster)
+        referents.discard(canonical_id)
+        if not canonicals:
+            referents = {r for r in referents if not Identifier.get(r).canonical}
+        return referents
+
+    def apply(self, proxy: SE) -> SE:
+        """Replace all entity references in a given proxy with their canonical
+        identifiers. This is essentially the harmonisation post de-dupe."""
+        if proxy.id is None:
+            return proxy
+        proxy.id = self.get_canonical(proxy.id)
+        return self.apply_properties(proxy)
+
+    def apply_stream(self, proxy: ValueEntity) -> ValueEntity:
+        if proxy.id is None:
+            return proxy
+        proxy.id = self.get_canonical(proxy.id)
+        for prop in proxy.iterprops():
+            if prop.type == registry.entity:
+                values = proxy.pop(prop)
+                for value in values:
+                    proxy.unsafe_add(prop, self.get_canonical(value), cleaned=True)
+        return proxy
+
+    def apply_properties(self, proxy: SE) -> SE:
+        if proxy.id is None:
+            return proxy
+        for prop_name, stmts in proxy._statements.items():
+            out: set[Statement] = set()
+            for stmt in stmts:
+                stmt.canonical_id = proxy.id
+                if stmt.prop_type == registry.entity.name:
+                    canon_value = self.get_canonical(stmt._value)
+                    if canon_value != stmt.value:
+                        stmt = stmt.clone(
+                            value=canon_value,
+                            original_value=stmt.original_value or stmt._value,
+                        )
+                out.add(stmt)
+            proxy._statements[prop_name] = out
+        return proxy
+
+    def apply_statement(self, stmt: Statement) -> Statement:
+        if stmt.entity_id is not None:
+            stmt.canonical_id = self.get_canonical(stmt.entity_id)
+        if stmt.prop_type == registry.entity.name:
+            canon_value = self.get_canonical(stmt._value)
+            if canon_value != stmt._value:
+                stmt = stmt.clone(
+                    value=canon_value,
+                    original_value=stmt.original_value or stmt._value,
+                )
+        return stmt
+
+    def __repr__(self) -> str:
+        return f"<Linker({len(self._mapping)})>"

@@ -1,0 +1,245 @@
+import json
+import logging
+import os
+import traceback
+from abc import ABC, abstractmethod
+from collections.abc import Generator
+from typing import Any, Generic
+
+from banal import as_bool
+from followthemoney import DS, SE, StatementEntity, registry
+from followthemoney.settings import USER_AGENT
+from followthemoney.types.topic import TopicType
+from normality import stringify
+from requests import Session
+from requests.exceptions import ChunkedEncodingError, RequestException
+from rigour.urls import ParamsType, build_url
+from urllib3 import Retry
+from urllib3.exceptions import MaxRetryError
+
+from nomenklatura.cache import Cache
+from nomenklatura.util import HeadersType
+
+EnricherConfig = dict[str, Any]
+log = logging.getLogger(__name__)
+
+
+class EnrichmentException(Exception):
+    """A lookup failed for one entity; processing continues with the next."""
+
+
+class EnrichmentAbort(Exception):
+    """The enrichment source cannot be used at all, e.g. because of an
+    authorization failure. Callers should stop the run."""
+
+
+class BaseEnricher(Generic[DS]):
+    def __init__(self, dataset: DS, cache: Cache, config: EnricherConfig):
+        self.dataset = dataset
+        self.cache = cache
+        self.config = config
+        self.cache_days = int(config.pop("cache_days", 90))
+        self._filter_schemata = config.pop("schemata", [])
+        filter_topics = set(config.pop("topics", []))
+        if "all" in filter_topics:
+            assert isinstance(registry.topic, TopicType)
+            filter_topics.discard("all")
+            filter_topics.update(registry.topic.names.keys())
+        # The resolved `topics` config option. Exposed so that callers gating
+        # further processing on the same topics use an identical set.
+        self.filter_topics: set[str] = filter_topics
+
+    def get_config_expand(self, name: str, default: str | None = None) -> str | None:
+        value = self.config.get(name, default)
+        if value is None:
+            return None
+        return str(os.path.expandvars(value))
+
+    def get_config_int(self, name: str, default: int | str) -> int:
+        return int(self.config.get(name, default))
+
+    def get_config_bool(self, name: str, default: bool | str = False) -> int:
+        return as_bool(self.config.get(name, default))
+
+    def get_config_list(self, name: str, default: list[str] | None = None) -> list[str]:
+        """Get a config option that is a list of strings."""
+        value = self.config.get(name, default)
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            raise ValueError(f"Expected list for config option {name}")
+        strings = [stringify(v) for v in value]
+        return [s for s in strings if s is not None]
+
+    def _filter_entity(self, entity: StatementEntity) -> bool:
+        """Check if the given entity should be filtered out. Filters
+        can be applied by schema or by topic."""
+        if len(self._filter_schemata):
+            if entity.schema.name not in self._filter_schemata:
+                return False
+        if len(self.filter_topics):
+            topics = set(entity.get_type_values(registry.topic))
+            if not topics.intersection(self.filter_topics):
+                return False
+        return True
+
+
+class Enricher(BaseEnricher[DS], ABC):
+    """A connector to an external data source that finds candidate matches
+    for entities and retrieves their related records.
+
+    Subclasses implement `match()` and `expand()`. The base class provides an
+    HTTP session and caching request helpers, so repeated runs against the
+    same source don't re-fetch from the remote API."""
+
+    def __init__(
+        self,
+        dataset: DS,
+        cache: Cache,
+        config: EnricherConfig,
+        session: Session | None = None,
+    ):
+        super().__init__(dataset, cache, config)
+        self._session: Session | None = session
+
+    @property
+    def session(self) -> Session:
+        if self._session is None:
+            self._session = Session()
+            self._session.headers["User-Agent"] = USER_AGENT
+        return self._session
+
+    def http_get_cached(
+        self,
+        url: str,
+        params: ParamsType = None,
+        hidden: ParamsType = None,
+        cache_days: int | None = None,
+    ) -> str:
+        url = build_url(url, params=params)
+        cache_days_ = self.cache_days if cache_days is None else cache_days
+        response = self.cache.get(url, max_age=cache_days_)
+        if response is None:
+            log.debug("HTTP GET: %s", url)
+            hidden_url = build_url(url, params=hidden)
+            try:
+                resp = self.session.get(hidden_url)
+                resp.raise_for_status()
+            except RequestException as rex:
+                if rex.response is not None and rex.response.status_code in (401, 403):
+                    raise EnrichmentAbort("Authorization failure: %s" % url) from rex
+                msg = "HTTP fetch failed [%s]: %s" % (url, rex)
+                log.info(f"{msg}\n{traceback.format_exc()}")
+                raise EnrichmentException(msg) from rex
+            response = resp.text
+            if cache_days_ > 0:
+                self.cache.set(url, response)
+        return response
+
+    def http_remove_cache(self, url: str, params: ParamsType = None) -> None:
+        url = build_url(url, params=params)
+        self.cache.delete(url)
+
+    def http_get_json_cached(
+        self,
+        url: str,
+        params: ParamsType = None,
+        hidden: ParamsType = None,
+        cache_days: int | None = None,
+    ) -> Any:
+        res = self.http_get_cached(url, params, hidden=hidden, cache_days=cache_days)
+        return json.loads(res)
+
+    def http_post_json_cached(
+        self,
+        url: str,
+        cache_key: str,
+        json: Any = None,
+        data: Any = None,
+        headers: HeadersType = None,
+        cache_days: int | None = None,
+        retry_chunked_encoding_error: int = 3,
+    ) -> Any:
+        cache_days_ = self.cache_days if cache_days is None else cache_days
+        resp_data = self.cache.get_json(cache_key, max_age=cache_days_)
+        if resp_data is not None:
+            return resp_data
+
+        # urllib3's Retry on the session does not retry chunked encoding
+        # errors (https://github.com/urllib3/urllib3/issues/2751#issuecomment-2567630065),
+        # so retry them here.
+        retry = Retry(total=retry_chunked_encoding_error, backoff_factor=2)
+        while not retry.is_exhausted():
+            try:
+                resp = self.session.post(url, json=json, data=data, headers=headers)
+                resp.raise_for_status()
+                break
+            except ChunkedEncodingError as rex:
+                msg = "HTTP POST failed [%s]: %s" % (url, rex)
+                if "Response ended prematurely" not in str(rex):
+                    raise EnrichmentException(msg) from rex
+                try:
+                    retry = retry.increment(method="POST", url=url, error=rex)
+                except MaxRetryError:
+                    raise EnrichmentException(msg) from rex
+                log.info("Retrying due to chunked encoding error: %s", rex)
+                retry.sleep()
+            except RequestException as rex:
+                if rex.response is not None and rex.response.status_code in (401, 403):
+                    raise EnrichmentAbort("Authorization failure: %s" % url) from rex
+
+                msg = "HTTP POST failed [%s]: %s" % (url, rex)
+                log.info(f"{msg}\n{traceback.format_exc()}")
+                raise EnrichmentException(msg) from rex
+        resp_data = resp.json()
+        if cache_days_ > 0:
+            self.cache.set_json(cache_key, resp_data)
+        return resp_data
+
+    def _make_data_entity(
+        self, entity: SE, data: dict[str, Any], cleaned: bool = True
+    ) -> SE:
+        """Create an entity which is of the same sub-type of SE as the given
+        query entity."""
+        return type(entity).from_data(self.dataset, data, cleaned=cleaned)
+
+    def load_entity(self, entity: SE, data: dict[str, Any]) -> SE:
+        proxy = self._make_data_entity(entity, data, cleaned=False)
+        for prop in proxy.iterprops():
+            if prop.stub:
+                proxy.pop(prop)
+        return proxy
+
+    def make_entity(self, entity: SE, schema: str) -> SE:
+        """Create a new entity of the given schema."""
+        return self._make_data_entity(entity, {"schema": schema})
+
+    def match_wrapped(self, entity: SE) -> Generator[SE, None, None]:
+        if not self._filter_entity(entity):
+            return
+        yield from self.match(entity)
+
+    def expand_wrapped(self, entity: SE, match: SE) -> Generator[SE, None, None]:
+        """Yield the confirmed match itself, followed by entities related to
+        it in the external source (e.g. officers, owners, family members).
+
+        Only yields if ``entity`` passes the filter."""
+        if not self._filter_entity(entity):
+            return
+        yield from self.expand(entity, match)
+
+    @abstractmethod
+    def match(self, entity: SE) -> Generator[SE, None, None]:
+        """Yield candidates from the external source that may describe the
+        same real-world entity as the given query entity."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def expand(self, entity: SE, match: SE) -> Generator[SE, None, None]:
+        """Yield the confirmed match itself, followed by entities related to
+        it in the external source (e.g. officers, owners, family members)."""
+        raise NotImplementedError
+
+    def close(self) -> None:
+        if self._session is not None:
+            self._session.close()

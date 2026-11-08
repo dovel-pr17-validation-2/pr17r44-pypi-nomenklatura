@@ -1,0 +1,772 @@
+# Test realistic memory usage with constrained memory because duckdb only spills
+# when it's constrained, but you don't know how much more memory it will use than
+# the memory limit.
+# e.g. docker build . --tag opensanctions and
+# docker run -ti --name xref \
+#            -v ./data:/data
+#            -v .:/opensanctions \
+#            --memory 3G
+#            -e ZAVOD_DATA_PATH=/data
+#            -e ZAVOD_DATABASE_URI=postgresql://postgres:password@host.docker.internal:5432/dev
+#            opensanctions bash
+#
+# Debugging memory usage?
+# https://duckdb.org/docs/stable/guides/troubleshooting/oom_errors
+#
+# Most DuckDB operations spill to disk when its memory_limit setting is reached.
+#
+# DuckDB uses more memory than its memory_limit setting.
+# > This limit only applies to the buffer manager.
+# https://duckdb.org/docs/1.2/operations_manual/limits
+#
+# Beyond that, other things in zavod also use memory.
+#
+# When duckdb's memory_limit is reached and it cannot spill to disk,
+# it will throw an error like duckdb.duckdb.OutOfMemoryException:
+# Out of Memory Error: could not allocate block of size 30.5 MiB (32.8 MiB/47.6 MiB used)
+#
+# When the process is killed due to the operating system running out of memory,
+# making memory_limit smaller might help fit what the buffer manager manages,
+# plus all the additional DuckDB and non-DuckDB memory usage.
+import csv
+import logging
+from collections import defaultdict
+from collections.abc import Generator, Iterable
+from itertools import islice
+from pathlib import Path
+from time import perf_counter
+from typing import Any, ClassVar, TypeVar
+
+from followthemoney import DS, SE, StatementEntity, model, registry
+from rigour.reset import reset_caches
+
+from nomenklatura import duck
+from nomenklatura.blocker.tokenizer import (
+    NAME_PART_FIELD,
+    SYMBOL_FIELD,
+    WORD_FIELD,
+    tokenize_entity,
+)
+from nomenklatura.resolver import Identifier
+from nomenklatura.store import View
+
+BlockingMatches = list[tuple[Identifier, float]]
+R = TypeVar("R")
+
+log = logging.getLogger(__name__)
+
+BATCH_SIZE = 10_000
+DEFAULT_MAX_BUCKET_SIZE = 60
+# Matching candidates below this fraction of their subject's best score are
+# noise: they'd need the matcher to overrule an order-of-magnitude weaker
+# blocker signal. Equivalent to ten 20%-wide score bands (0.8^10).
+DEFAULT_MIN_SCORE_RATIO = 0.1
+
+
+def _bucket_pair_cost(bucket_size: int, cross: bool = False) -> int:
+    if bucket_size < 0:
+        raise ValueError("max_bucket_size must be >= 0")
+    if cross:
+        return bucket_size * bucket_size
+    return bucket_size * max(0, bucket_size - 1) // 2
+
+
+def batched(iterable: Iterable[R], n: int) -> Generator[tuple[R, ...], None, None]:
+    iterator = iter(iterable)
+    while batch := tuple(islice(iterator, n)):
+        yield batch
+
+
+class Index:
+    """Rank token-overlapping entity candidates with a DuckDB index.
+
+    Use this to generate dedupe pairs or match incoming entities when exhaustive
+    comparison is impractical.
+    """
+
+    BOOSTS: ClassVar[dict[str, float]] = {
+        NAME_PART_FIELD: 5.0,
+        WORD_FIELD: 0.5,
+        registry.name.name: 15.0,
+        registry.phone.name: 10.0,
+        registry.email.name: 10.0,
+        registry.address.name: 1.0,
+        registry.identifier.name: 10.0,
+    }
+
+    def __init__(
+        self,
+        view: View[DS, SE],
+        data_dir: Path,
+        options: dict[str, Any] | None = None,
+    ):
+        self.view = view
+        options = options or {}
+        self.max_candidates = int(options.get("max_candidates", 75))
+        self.min_score_ratio = float(
+            options.get("min_score_ratio", DEFAULT_MIN_SCORE_RATIO)
+        )
+        self.max_bucket_size = int(
+            options.get("max_bucket_size", DEFAULT_MAX_BUCKET_SIZE)
+        )
+        self.max_pair_cost = _bucket_pair_cost(self.max_bucket_size)
+        self.max_match_pair_cost = _bucket_pair_cost(self.max_bucket_size, cross=True)
+        self.data_dir = data_dir.resolve()
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        log.info(
+            "Blocker index configured: max_bucket_size=%d, "
+            "pair cost cap=%d, matching pair cost cap=%d, "
+            "max_candidates=%d, min_score_ratio=%.2f",
+            self.max_bucket_size,
+            self.max_pair_cost,
+            self.max_match_pair_cost,
+            self.max_candidates,
+            self.min_score_ratio,
+        )
+        self.duckdb_path = self.data_dir / "index.duckdb"
+        self.con = duck.connect(self.duckdb_path, memory_mb=options.get("memory"))
+
+    def load_entities(self, table: str, entities: Iterable[StatementEntity]) -> None:
+        path = self.data_dir / f"{table}.csv"
+        self.con.execute(f"""
+        CREATE OR REPLACE TABLE {table}
+            (schema TEXT, id TEXT, field TEXT, token TEXT, count INT)
+        """)
+        self.con.execute(f"DELETE FROM {table}")
+
+        def generate() -> Generator[tuple[str, str, str, str, int], None, None]:
+            idx = 0
+            tokens = 0
+            for entity in entities:
+                if not entity.schema.matchable or entity.id is None:
+                    continue
+                counts: dict[tuple[str, str], int] = defaultdict(int)
+                for field, token in tokenize_entity(entity):
+                    token = token[:40]  # Limit token length
+                    counts[(field, token)] += 1
+
+                for (field, token), count in counts.items():
+                    yield (entity.schema.name, entity.id, field, token, count)
+                    tokens += 1
+
+                idx += 1
+                if idx % 50000 == 0:
+                    log.info("Loaded %d entities (%d tokens)", idx, tokens)
+
+        log.info("Loading data to table %r...", table)
+        for batch in batched(generate(), 500_000):
+            with open(path, "w", encoding="utf-8") as fh:
+                writer = csv.writer(fh)
+                for row in batch:
+                    writer.writerow(row)
+            self.con.execute(f"""
+                INSERT INTO {table} SELECT * FROM
+                    read_csv('{path.as_posix()}',
+                        HEADER=FALSE,
+                        QUOTE='\"',
+                        DELIM=',',
+                        ENCODING='utf-8',
+                        COMPRESSION='none',
+                        SAMPLE_SIZE=5
+                    )
+            """)
+
+        path.unlink(missing_ok=True)
+        reset_caches()
+        self.con.execute("CHECKPOINT")
+
+    def entity_count(self, table: str) -> int:
+        if not self._has_table(table):
+            return 0
+        q = f"SELECT COUNT(DISTINCT id) FROM {table}"
+        res = self.con.execute(q).fetchone()
+        return res[0] if res is not None else 0
+
+    def _has_table(self, table: str) -> bool:
+        tables_ = self.con.execute("PRAGMA show_tables").fetchall()
+        tables = {t[0] for t in tables_}
+        return table in tables
+
+    def build(self) -> None:
+        """Index all entities in the dataset."""
+        log.info("Building index from: %r...", self.view)
+        self.con.execute("CREATE OR REPLACE TABLE boosts (field TEXT, boost FLOAT)")
+        for field, boost in self.BOOSTS.items():
+            self.con.execute("INSERT INTO boosts VALUES (?, ?)", [field, boost])
+        for type in registry.types:
+            if type.name in self.BOOSTS:
+                continue
+            self.con.execute("INSERT INTO boosts VALUES (?, ?)", [type.name, 1.0])
+
+        q = """CREATE OR REPLACE TABLE schemata ("left" TEXT, "right" TEXT)"""
+        self.con.execute(q)
+        for left in model.schemata.values():
+            for right in left.matchable_schemata:
+                q = "INSERT INTO schemata VALUES (?, ?)"
+                self.con.execute(q, [left.name, right.name])
+
+        schemata = list(model.matchable_schemata())
+        self.load_entities("entries", self.view.entities(include_schemata=schemata))
+        self._build_frequencies()
+        log.info("Index built.")
+
+    def _build_stopwords(self) -> None:
+        log.info(
+            "Building dynamic stopwords with max bucket size %d (pair cost cap %d)...",
+            self.max_bucket_size,
+            self.max_pair_cost,
+        )
+        token_schema_counts_query = """
+        CREATE OR REPLACE TABLE token_schema_counts AS
+            SELECT
+                token,
+                any_value(field) AS field,
+                schema,
+                count(*) AS df,
+                sum("count") AS freq
+            FROM entries
+            GROUP BY token, schema
+        """
+        self.con.execute(token_schema_counts_query)
+
+        token_stats_query = """
+        CREATE OR REPLACE TABLE token_stats AS
+            WITH schema_pairs AS (
+                SELECT DISTINCT
+                    least("left", "right") AS left_schema,
+                    greatest("left", "right") AS right_schema
+                FROM schemata
+            ),
+            compatible AS (
+                SELECT
+                    l.token,
+                    sum(
+                        CASE
+                            WHEN l.schema = r.schema THEN
+                                cast(l.df * (l.df - 1) / 2 AS HUGEINT)
+                            ELSE
+                                cast(l.df * r.df AS HUGEINT)
+                        END
+                    ) AS compatible_pair_cost
+                FROM token_schema_counts AS l
+                JOIN token_schema_counts AS r
+                    ON l.token = r.token
+                   AND l.schema <= r.schema
+                JOIN schema_pairs AS s
+                    ON s.left_schema = l.schema
+                   AND s.right_schema = r.schema
+                GROUP BY l.token
+            ),
+            totals AS (
+                SELECT
+                    token,
+                    any_value(field) AS field,
+                    sum(freq) AS freq,
+                    sum(df) AS df
+                FROM token_schema_counts
+                GROUP BY token
+            )
+            SELECT
+                totals.token,
+                totals.field,
+                totals.freq,
+                totals.df,
+                ifnull(compatible.compatible_pair_cost, 0) AS compatible_pair_cost,
+                ifnull(compatible.compatible_pair_cost, 0) > ? AS stopword
+            FROM totals
+            LEFT JOIN compatible ON compatible.token = totals.token
+        """
+        self.con.execute(token_stats_query, [self.max_pair_cost])
+
+        stopwords_query = """
+        CREATE OR REPLACE TABLE stopwords AS
+            SELECT token, field, freq, df, compatible_pair_cost
+            FROM token_stats
+            WHERE stopword
+        """
+        self.con.execute(stopwords_query)
+        self._log_stopword_stats("token_stats", "stopwords", "Dynamic stopwords")
+
+    def _build_matching_stopwords(self) -> None:
+        log.info(
+            "Building matching stopwords with max bucket size %d "
+            "(matching pair cost cap %d)...",
+            self.max_bucket_size,
+            self.max_match_pair_cost,
+        )
+        matching_token_schema_counts_query = """
+        CREATE OR REPLACE TABLE matching_token_schema_counts AS
+            SELECT
+                token,
+                any_value(field) AS field,
+                schema,
+                count(*) AS df,
+                sum("count") AS freq
+            FROM matching
+            GROUP BY token, schema
+        """
+        self.con.execute(matching_token_schema_counts_query)
+
+        matching_token_stats_query = """
+        CREATE OR REPLACE TABLE matching_token_stats AS
+            WITH indexed_token_schema_counts AS (
+                SELECT
+                    token,
+                    schema,
+                    count(*) AS df
+                FROM term_frequencies_all
+                GROUP BY token, schema
+            ),
+            compatible AS (
+                SELECT
+                    m.token,
+                    sum(cast(m.df * i.df AS HUGEINT)) AS compatible_pair_cost
+                FROM matching_token_schema_counts AS m
+                JOIN indexed_token_schema_counts AS i
+                    ON i.token = m.token
+                JOIN schemata AS s
+                    ON s.left = m.schema
+                   AND s.right = i.schema
+                GROUP BY m.token
+            ),
+            totals AS (
+                SELECT
+                    token,
+                    any_value(field) AS field,
+                    sum(freq) AS freq,
+                    sum(df) AS df
+                FROM matching_token_schema_counts
+                GROUP BY token
+            )
+            SELECT
+                totals.token,
+                totals.field,
+                totals.freq,
+                totals.df,
+                ifnull(compatible.compatible_pair_cost, 0) AS compatible_pair_cost,
+                ifnull(compatible.compatible_pair_cost, 0) > ? AS stopword
+            FROM totals
+            LEFT JOIN compatible ON compatible.token = totals.token
+        """
+        self.con.execute(matching_token_stats_query, [self.max_match_pair_cost])
+
+        matching_stopwords_query = """
+        CREATE OR REPLACE TABLE matching_stopwords AS
+            SELECT token, field, freq, df, compatible_pair_cost
+            FROM matching_token_stats
+            WHERE stopword
+        """
+        self.con.execute(matching_stopwords_query)
+        self._log_stopword_stats(
+            "matching_token_stats",
+            "matching_stopwords",
+            "Matching stopwords",
+        )
+
+    def _log_stopword_stats(
+        self, stats_table: str, stopwords_table: str, label: str
+    ) -> None:
+        stats_query = f"""
+            SELECT
+                count(*) AS tokens,
+                ifnull(sum(CASE WHEN stopword THEN 1 ELSE 0 END), 0) AS stopwords,
+                ifnull(sum(CASE WHEN stopword THEN compatible_pair_cost ELSE 0 END), 0)
+                    AS stopped_pair_cost,
+                ifnull(sum(CASE WHEN NOT stopword THEN compatible_pair_cost ELSE 0 END), 0)
+                    AS kept_pair_cost,
+                ifnull(max(CASE WHEN NOT stopword THEN compatible_pair_cost ELSE NULL END), 0)
+                    AS max_kept_pair_cost,
+                ifnull(max(CASE WHEN NOT stopword THEN df ELSE NULL END), 0) AS max_kept_df,
+                ifnull(min(CASE WHEN stopword THEN compatible_pair_cost ELSE NULL END), 0)
+                    AS min_stopped_pair_cost,
+                ifnull(min(CASE WHEN stopword THEN df ELSE NULL END), 0) AS min_stopped_df
+            FROM {stats_table}
+        """
+        stats = self.con.execute(stats_query).fetchone()
+        if stats is None:
+            return
+        (
+            tokens,
+            stopwords,
+            stopped_pair_cost,
+            kept_pair_cost,
+            max_kept_pair_cost,
+            max_kept_df,
+            min_stopped_pair_cost,
+            min_stopped_df,
+        ) = stats
+        log.info(
+            "%s built: %d/%d tokens stopped, "
+            "compatible pair cost kept=%d stopped=%d, "
+            "max kept token cost=%d, max kept df=%d, "
+            "min stopped token cost=%d, min stopped df=%d",
+            label,
+            stopwords,
+            tokens,
+            kept_pair_cost,
+            stopped_pair_cost,
+            max_kept_pair_cost,
+            max_kept_df,
+            min_stopped_pair_cost,
+            min_stopped_df,
+        )
+        top_stopwords_query = f"""
+            SELECT field, token, df, compatible_pair_cost
+            FROM {stopwords_table}
+            ORDER BY compatible_pair_cost DESC, token ASC
+            LIMIT 10
+        """
+        top_stopwords = "\n".join(
+            f"{field} {token} df={df} cost={compatible_pair_cost}"
+            for field, token, df, compatible_pair_cost in self.con.execute(
+                top_stopwords_query
+            ).fetchall()
+        )
+        if len(top_stopwords):
+            log.info("Top %s:\n%s\n", label.lower(), top_stopwords)
+        top_kept_query = f"""
+            SELECT field, token, df, compatible_pair_cost
+            FROM {stats_table}
+            WHERE NOT stopword
+            ORDER BY compatible_pair_cost DESC, token ASC
+            LIMIT 10
+        """
+        top_kept = "\n".join(
+            f"{field} {token} df={df} cost={compatible_pair_cost}"
+            for field, token, df, compatible_pair_cost in self.con.execute(
+                top_kept_query
+            ).fetchall()
+        )
+        if len(top_kept):
+            token_label = label.lower().removesuffix(" stopwords")
+            log.info("Largest kept %s tokens:\n%s\n", token_label, top_kept)
+
+    def _apply_stopwords(
+        self,
+        origin_table: str,
+        target_table: str,
+        stopwords_table: str | None = "stopwords",
+    ) -> None:
+        log.info("Filtering stopwords from %r, as %r...", origin_table, target_table)
+        started = perf_counter()
+        res = self.con.execute(f"SELECT COUNT(*) FROM {origin_table}").fetchone()
+        origin_count = res[0] if res is not None else 0
+        if stopwords_table is None:
+            q = f"""
+            CREATE OR REPLACE TABLE {target_table} as
+                SELECT e.*
+                FROM {origin_table} AS e
+            """
+        else:
+            q = f"""
+            CREATE OR REPLACE TABLE {target_table} as
+                SELECT e.*
+                FROM {origin_table} AS e
+                LEFT OUTER JOIN {stopwords_table} AS sw ON sw.token = e.token
+                WHERE sw.token is NULL
+            """
+        self.con.execute(q)
+        res = self.con.execute(f"SELECT COUNT(*) FROM {target_table}").fetchone()
+        target_count = res[0] if res is not None else 0
+        log.info(
+            "Filtered stopwords from %r to %r: kept %d/%d rows in %.2fs",
+            origin_table,
+            target_table,
+            target_count,
+            origin_count,
+            perf_counter() - started,
+        )
+
+    def _build_frequencies(self) -> None:
+        log.info("Calculating term weights...")
+        # IDF separates distinctive evidence from common-token noise without
+        # letting aliases dilute full-name matches. Dampen alias-derived parts
+        # and symbols because they multiply with the number of names.
+        term_frequencies_query = f"""
+        CREATE OR REPLACE TABLE term_frequencies_all AS
+            WITH entity_count AS (
+                SELECT count(DISTINCT id) AS n FROM entries
+            ),
+            token_idf AS (
+                SELECT e.token, 1.0 + ln(c.n / count(DISTINCT e.id)) AS idf
+                FROM entries AS e, entity_count AS c
+                GROUP BY e.token, c.n
+            ),
+            name_counts AS (
+                SELECT id, greatest(1, sum(count)) AS n_names
+                FROM entries
+                WHERE field = '{registry.name.name}'
+                GROUP BY id
+            )
+            SELECT e.schema, e.field, e.token, e.id,
+                CASE WHEN e.field IN ('{NAME_PART_FIELD}', '{SYMBOL_FIELD}')
+                    THEN ifnull(boo.boost, 1) * i.idf
+                        / sqrt(ifnull(nc.n_names, 1))
+                    ELSE ifnull(boo.boost, 1) * i.idf
+                END AS weight
+            FROM entries AS e
+            JOIN token_idf AS i ON i.token = e.token
+            LEFT OUTER JOIN name_counts AS nc ON nc.id = e.id
+            LEFT OUTER JOIN boosts boo ON e.field = boo.field
+        """
+        self.con.execute(term_frequencies_query)
+
+    def _ensure_pair_stopwords(self) -> None:
+        if not self._has_table("stopwords"):
+            self._build_stopwords()
+        if not self._has_table("entries_filtered"):
+            self._apply_stopwords("entries", "entries_filtered")
+        self._apply_stopwords("term_frequencies_all", "term_frequencies")
+
+    def _log_pair_query_stats(self, max_pairs: int) -> None:
+        table_stats_query = """
+            SELECT
+                count(*) AS rows,
+                count(DISTINCT id) AS entities,
+                count(DISTINCT token) AS tokens
+            FROM term_frequencies
+        """
+        table_stats = self.con.execute(table_stats_query).fetchone()
+        if table_stats is None:
+            return
+        rows, entities, tokens = table_stats
+        cost_stats_query = """
+            SELECT
+                count(*) AS tokens,
+                ifnull(sum(df), 0) AS token_memberships,
+                ifnull(sum(compatible_pair_cost), 0) AS candidate_token_pairs,
+                ifnull(max(compatible_pair_cost), 0) AS max_token_cost,
+                ifnull(max(df), 0) AS max_df
+            FROM token_stats
+            WHERE NOT stopword
+        """
+        cost_stats = self.con.execute(cost_stats_query).fetchone()
+        if cost_stats is None:
+            return
+        (
+            kept_tokens,
+            token_memberships,
+            candidate_token_pairs,
+            max_token_cost,
+            max_df,
+        ) = cost_stats
+        log.info(
+            "Pair query input: %d entities, %d term rows, %d distinct tokens; "
+            "%d kept stopword-stat tokens with %d token memberships; "
+            "estimated candidate token-pair rows=%d, max token cost=%d, "
+            "max df=%d, output limit=%d",
+            entities,
+            rows,
+            tokens,
+            kept_tokens,
+            token_memberships,
+            candidate_token_pairs,
+            max_token_cost,
+            max_df,
+            max_pairs,
+        )
+
+    def pairs(
+        self, max_pairs: int = 10_000
+    ) -> Iterable[tuple[tuple[Identifier, Identifier], float]]:
+        self._ensure_pair_stopwords()
+        self._log_pair_query_stats(max_pairs)
+        log.info("Generating pairs...")
+        # Limit correlated evidence with logarithmic credit per field.
+        pairs_query = """
+            SELECT lid, rid, sum(maxw * (1.0 + ln(n))) AS score
+            FROM (
+                SELECT "left".id AS lid, "right".id AS rid, "left".field AS field,
+                    max("left".weight + "right".weight) AS maxw, count(*) AS n
+                FROM term_frequencies as "left"
+                JOIN term_frequencies as "right"
+                    ON "left".token = "right".token AND "left".field = "right".field
+                INNER JOIN schemata ON schemata.left = "left".schema AND schemata.right = "right".schema
+                WHERE "left".id > "right".id
+                GROUP BY "left".id, "right".id, "left".field
+            )
+            GROUP BY lid, rid
+            ORDER BY score DESC, lid, rid
+            LIMIT ?
+        """
+        started = perf_counter()
+        results = self.con.execute(pairs_query, [max_pairs])
+        log.info(
+            "Pair query ready in %.2fs, fetching up to %d pairs...",
+            perf_counter() - started,
+            max_pairs,
+        )
+        yielded = 0
+        first_batch = True
+        while batch := results.fetchmany(BATCH_SIZE):
+            if first_batch:
+                log.info(
+                    "Pair query fetched first batch of %d pairs in %.2fs",
+                    len(batch),
+                    perf_counter() - started,
+                )
+                first_batch = False
+            yielded += len(batch)
+            for left, right, score in batch:
+                yield (Identifier.get(left), Identifier.get(right)), score
+        log.info(
+            "Pair generation complete: yielded %d pairs in %.2fs",
+            yielded,
+            perf_counter() - started,
+        )
+
+    def match_entities(
+        self, entities: Iterable[StatementEntity]
+    ) -> Generator[
+        tuple[Identifier, BlockingMatches],
+        None,
+        None,
+    ]:
+        self.load_entities("matching", entities)
+        self._build_matching_stopwords()
+        self._apply_stopwords(
+            "matching",
+            "matching_filtered",
+            stopwords_table="matching_stopwords",
+        )
+        yield from self._find_matches()
+
+    def _find_matches(
+        self,
+    ) -> Generator[
+        tuple[Identifier, BlockingMatches],
+        None,
+        None,
+    ]:
+        q = "SELECT COUNT(DISTINCT id) FROM matching_filtered"
+        res = self.con.execute(q).fetchone()
+        num_matching = res[0] if res is not None else 0
+        self._log_matching_query_stats(num_matching)
+
+        log.info("Matching %d entities...", num_matching)
+        # Same per-field aggregation as pairs(), then per-subject top-K and a
+        # relative score floor inside the query, so DuckDB never sorts or
+        # ships candidate rows that would be discarded here (issue #351).
+        matches_query = """
+        WITH field_scores AS (
+            SELECT m.id AS matching_id, tf.id AS matches_id, tf.field AS field,
+                max(tf.weight) AS maxw, count(*) AS n
+            FROM matching_filtered m
+            JOIN term_frequencies_all tf
+            ON m.token = tf.token AND m.field = tf.field AND tf.id != m.id
+            INNER JOIN schemata s
+            ON s.left = m.schema AND s.right = tf.schema
+            GROUP BY m.id, tf.id, tf.field
+        ),
+        pair_scores AS (
+            SELECT matching_id, matches_id, sum(maxw * (1.0 + ln(n))) AS score
+            FROM field_scores
+            GROUP BY matching_id, matches_id
+        )
+        SELECT matching_id, matches_id, score
+        FROM (
+            SELECT matching_id, matches_id, score,
+                row_number() OVER w AS rn,
+                first_value(score) OVER w AS best
+            FROM pair_scores
+            WINDOW w AS (PARTITION BY matching_id ORDER BY score DESC, matches_id)
+        )
+        WHERE rn <= ? AND score >= best * ?
+        ORDER BY matching_id, rn
+        """
+        started = perf_counter()
+        results = self.con.execute(
+            matches_query, [self.max_candidates, self.min_score_ratio]
+        )
+        log.info("Matching query ready in %.2fs", perf_counter() - started)
+        previous_id = None
+        matches: BlockingMatches = []
+        rows = 0
+        subjects = 0
+        while batch := results.fetchmany(BATCH_SIZE):
+            rows += len(batch)
+            for matching_id, match_id, score in batch:
+                if matching_id != previous_id:
+                    if previous_id is not None:
+                        subjects += 1
+                        yield Identifier.get(previous_id), matches
+                    matches = []
+                    previous_id = matching_id
+                matches.append((Identifier.get(match_id), score))
+        if previous_id is not None:
+            subjects += 1
+            yield Identifier.get(previous_id), matches
+        log.info(
+            "Matching complete: read %d candidate rows for %d subjects in %.2fs",
+            rows,
+            subjects,
+            perf_counter() - started,
+        )
+
+    def _log_matching_query_stats(self, num_matching: int) -> None:
+        matching_stats_query = """
+            SELECT
+                count(*) AS rows,
+                count(DISTINCT id) AS entities,
+                count(DISTINCT token) AS tokens
+            FROM matching_filtered
+        """
+        matching_stats = self.con.execute(matching_stats_query).fetchone()
+        index_stats_query = """
+            SELECT
+                count(*) AS rows,
+                count(DISTINCT id) AS entities,
+                count(DISTINCT token) AS tokens
+            FROM term_frequencies_all
+        """
+        index_stats = self.con.execute(index_stats_query).fetchone()
+        cost_stats_query = """
+            SELECT
+                count(*) AS tokens,
+                ifnull(sum(df), 0) AS token_memberships,
+                ifnull(sum(compatible_pair_cost), 0) AS candidate_token_pairs,
+                ifnull(max(compatible_pair_cost), 0) AS max_token_cost,
+                ifnull(max(df), 0) AS max_matching_df
+            FROM matching_token_stats
+            WHERE NOT stopword
+        """
+        cost_stats = self.con.execute(cost_stats_query).fetchone()
+        if matching_stats is None or index_stats is None or cost_stats is None:
+            return
+        matching_rows, matching_entities, matching_tokens = matching_stats
+        index_rows, index_entities, index_tokens = index_stats
+        (
+            kept_tokens,
+            token_memberships,
+            candidate_token_pairs,
+            max_token_cost,
+            max_matching_df,
+        ) = cost_stats
+        log.info(
+            "Matching query input: %d entities (%d requested), %d matching "
+            "token rows, %d matching tokens; indexed side has %d entities, "
+            "%d token rows, %d tokens; %d kept stopword-stat tokens with "
+            "%d token memberships; estimated candidate token-pair rows=%d, "
+            "max token cost=%d, max matching df=%d",
+            matching_entities,
+            num_matching,
+            matching_rows,
+            matching_tokens,
+            index_entities,
+            index_rows,
+            index_tokens,
+            kept_tokens,
+            token_memberships,
+            candidate_token_pairs,
+            max_token_cost,
+            max_matching_df,
+        )
+
+    def close(self) -> None:
+        self.con.close()
+
+    def __repr__(self) -> str:
+        return "<DuckDBIndex(%r, %r)>" % (
+            self.view.scope.name,
+            self.con,
+        )
